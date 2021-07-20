@@ -165,22 +165,14 @@ bool ui_comp_put_grid(ScreenGrid *grid, int row, int col, int height, int width,
     }
 #endif
 
-    // TODO(bfredl): this is pretty ad-hoc, add a proper z-order/priority
-    // scheme. For now:
-    // - msg_grid is always on top.
-    // - pum_grid is on top of all windows but not msg_grid. Except for when
-    //   wildoptions=pum, and completing the cmdline with scrolled messages,
-    //   then the pum has to be drawn over the scrolled messages.
     size_t insert_at = kv_size(layers);
-    bool cmd_completion = (grid == &pum_grid && (State & CMDLINE)
-                           && (wop_flags & WOP_PUM));
-    if (kv_A(layers, insert_at-1) == &msg_grid && !cmd_completion) {
+    while (insert_at > 0 && kv_A(layers, insert_at-1)->zindex > grid->zindex) {
       insert_at--;
     }
-    if (kv_A(layers, insert_at-1) == &pum_grid && (grid != &msg_grid)) {
-      insert_at--;
-    }
-    if (insert_at > 1 && !on_top) {
+
+    if (curwin && kv_A(layers, insert_at-1) == &curwin->w_grid_alloc
+        && kv_A(layers, insert_at-1)->zindex == grid->zindex
+        && !on_top) {
       insert_at--;
     }
     // not found: new grid
@@ -222,7 +214,7 @@ void ui_comp_remove_grid(ScreenGrid *grid)
   grid->comp_index = 0;
 
   // recompose the area under the grid
-  // inefficent when being overlapped: only draw up to grid->comp_index
+  // inefficient when being overlapped: only draw up to grid->comp_index
   ui_comp_compose_grid(grid);
 }
 
@@ -278,12 +270,11 @@ static void ui_comp_grid_cursor_goto(UI *ui, Integer grid_handle,
   // should configure all grids before entering win_update()
   if (curgrid != &default_grid) {
     size_t new_index = kv_size(layers)-1;
-    if (kv_A(layers, new_index) == &msg_grid) {
+
+    while (new_index > 1 && kv_A(layers, new_index)->zindex > curgrid->zindex) {
       new_index--;
     }
-    if (kv_A(layers, new_index) == &pum_grid) {
-      new_index--;
-    }
+
     if (curgrid->comp_index < new_index) {
       ui_comp_raise_grid(curgrid, new_index);
     }
@@ -603,7 +594,7 @@ static void ui_comp_msg_set_pos(UI *ui, Integer grid, Integer row,
       int first_row = MAX((int)row-(scrolled?1:0), 0);
       compose_area(first_row, Rows-delta, 0, Columns);
     } else {
-      // scroll separator togheter with message text
+      // scroll separator together with message text
       int first_row = MAX((int)row-(msg_was_scrolled?1:0), 0);
       ui_composed_call_grid_scroll(1, first_row, Rows, 0, Columns, delta, 0);
       if (scrolled && !msg_was_scrolled && row > 0) {

@@ -141,7 +141,7 @@ EXTERN int cmdline_row;
 EXTERN int redraw_cmdline INIT(= false);          // cmdline must be redrawn
 EXTERN int clear_cmdline INIT(= false);           // cmdline must be cleared
 EXTERN int mode_displayed INIT(= false);          // mode is being displayed
-EXTERN int cmdline_star INIT(= false);            // cmdline is crypted
+EXTERN int cmdline_star INIT(= false);            // cmdline is encrypted
 EXTERN int redrawing_cmdline INIT(= false);       // cmdline is being redrawn
 EXTERN int cmdline_was_last_drawn INIT(= false);  // cmdline was last drawn
 
@@ -507,9 +507,6 @@ EXTERN int secure INIT(= false);
 /// Non-zero when changing text and jumping to another window/buffer is not
 /// allowed.
 EXTERN int textlock INIT(= 0);
-
-/// Non-zero when the current buffer can't be changed.  Used for FileChangedRO.
-EXTERN int curbuf_lock INIT(= 0);
 
 /// Non-zero when no buffer name can be changed, no buffer can be deleted and
 /// current directory can't be changed. Used for SwapExists et al.
@@ -878,6 +875,7 @@ EXTERN char_u e_invexpr2[] INIT(= N_("E15: Invalid expression: %s"));
 EXTERN char_u e_invrange[] INIT(= N_("E16: Invalid range"));
 EXTERN char_u e_invcmd[] INIT(= N_("E476: Invalid command"));
 EXTERN char_u e_isadir2[] INIT(= N_("E17: \"%s\" is a directory"));
+EXTERN char_u e_no_spell[] INIT(= N_("E756: Spell checking is not possible"));
 EXTERN char_u e_invchan[] INIT(= N_("E900: Invalid channel id"));
 EXTERN char_u e_invchanjob[] INIT(= N_("E900: Invalid channel id: not a job"));
 EXTERN char_u e_jobtblfull[] INIT(= N_("E901: Job table is full"));
@@ -987,6 +985,8 @@ EXTERN char_u e_dirnotf[] INIT(= N_(
     "E919: Directory not found in '%s': \"%s\""));
 EXTERN char_u e_au_recursive[] INIT(= N_(
     "E952: Autocommand caused recursive behavior"));
+EXTERN char_u e_autocmd_close[] INIT(= N_(
+    "E813: Cannot close autocmd window"));
 EXTERN char_u e_unsupportedoption[] INIT(= N_("E519: Option not supported"));
 EXTERN char_u e_fnametoolong[] INIT(= N_("E856: Filename too long"));
 EXTERN char_u e_float_as_string[] INIT(= N_("E806: using Float as a String"));

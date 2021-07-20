@@ -104,10 +104,14 @@ String nvim_exec(String src, Boolean output, Error *err)
   }
 
   try_start();
-  msg_silent++;
+  if (output) {
+    msg_silent++;
+  }
   do_source_str(src.data, "nvim_exec()");
-  capture_ga = save_capture_ga;
-  msg_silent = save_msg_silent;
+  if (output) {
+    capture_ga = save_capture_ga;
+    msg_silent = save_msg_silent;
+  }
   try_end(err);
 
   if (ERROR_SET(err)) {
@@ -213,10 +217,16 @@ Dictionary nvim__get_hl_defs(Integer ns_id, Error *err)
 ///
 /// @param ns_id number of namespace for this highlight
 /// @param name highlight group name, like ErrorMsg
-/// @param val highlight definiton map, like |nvim_get_hl_by_name|.
+/// @param val highlight definition map, like |nvim_get_hl_by_name|.
 ///            in addition the following keys are also recognized:
 ///              `default`: don't override existing definition,
 ///                         like `hi default`
+///              `ctermfg`: sets foreground of cterm color
+///              `ctermbg`: sets background of cterm color
+///              `cterm`  : cterm attribute map. sets attributed for
+///                         cterm colors. similer to `hi cterm`
+///                         Note: by default cterm attributes are
+///                               same as attributes of gui color
 /// @param[out] err Error details, if any
 ///
 /// TODO: ns_id = 0, should modify :highlight namespace
@@ -374,7 +384,7 @@ Integer nvim_input(String keys)
 ///       by calling it multiple times in a loop: the intermediate mouse
 ///       positions will be ignored. It should be used to implement real-time
 ///       mouse input in a GUI. The deprecated pseudokey form
-///       ("<LeftMouse><col,row>") of |nvim_input()| has the same limitiation.
+///       ("<LeftMouse><col,row>") of |nvim_input()| has the same limitation.
 ///
 /// @param button Mouse button: one of "left", "right", "middle", "wheel".
 /// @param action For ordinary buttons, one of "press", "drag", "release".
@@ -548,7 +558,7 @@ Object nvim_exec_lua(String code, Array args, Error *err)
 /// Notify the user with a message
 ///
 /// Relays the call to vim.notify . By default forwards your message in the
-/// echo area but can be overriden to trigger desktop notifications.
+/// echo area but can be overridden to trigger desktop notifications.
 ///
 /// @param msg        Message to display to the user
 /// @param log_level  The log level
@@ -974,7 +984,7 @@ Dictionary nvim_get_all_options_info(Error *err)
 /// Resulting dictionary has keys:
 ///     - name: Name of the option (like 'filetype')
 ///     - shortname: Shortened name of the option (like 'ft')
-///     - type: type of option ("string", "integer" or "boolean")
+///     - type: type of option ("string", "number" or "boolean")
 ///     - default: The default value for the option
 ///     - was_set: Whether the option was set.
 ///
@@ -1250,7 +1260,7 @@ fail:
 ///
 /// By default (and currently the only option) the terminal will not be
 /// connected to an external process. Instead, input send on the channel
-/// will be echoed directly by the terminal. This is useful to disply
+/// will be echoed directly by the terminal. This is useful to display
 /// ANSI terminal sequences returned as part of a rpc message, or similar.
 ///
 /// Note: to directly initiate the terminal using the right size, display the
@@ -1263,6 +1273,7 @@ fail:
 /// @param buffer the buffer to use (expected to be empty)
 /// @param opts   Optional parameters. Reserved for future use.
 /// @param[out] err Error details, if any
+/// @return Channel id, or 0 on error
 Integer nvim_open_term(Buffer buffer, Dictionary opts, Error *err)
   FUNC_API_SINCE(7)
 {
@@ -1279,7 +1290,7 @@ Integer nvim_open_term(Buffer buffer, Dictionary opts, Error *err)
   TerminalOptions topts;
   Channel *chan = channel_alloc(kChannelStreamInternal);
   topts.data = chan;
-  // NB: overriden in terminal_check_size if a window is already
+  // NB: overridden in terminal_check_size if a window is already
   // displaying the buffer
   topts.width = (uint16_t)MAX(curwin->w_width_inner - win_col_off(curwin), 0);
   topts.height = (uint16_t)curwin->w_height_inner;
@@ -1406,6 +1417,15 @@ void nvim_chan_send(Integer chan, String data, Error *err)
 ///   - `external`: GUI should display the window as an external
 ///       top-level window. Currently accepts no other positioning
 ///       configuration together with this.
+///   - `zindex`: Stacking order. floats with higher `zindex` go on top on
+///               floats with lower indices. Must be larger than zero. The
+///               following screen elements have hard-coded z-indices:
+///       - 100: insert completion popupmenu
+///       - 200: message scrollback
+///       - 250: cmdline completion popupmenu (when wildoptions+=pum)
+///     The default value for floats are 50.  In general, values below 100 are
+///     recommended, unless there is a good reason to overshadow builtin
+///     elements.
 ///   - `style`: Configure the appearance of the window. Currently only takes
 ///       one non-empty value:
 ///       - "minimal"  Nvim will display the window with many UI options
@@ -1417,28 +1437,33 @@ void nvim_chan_send(Integer chan, String data, Error *err)
 ///                    end-of-buffer region is hidden by setting `eob` flag of
 ///                    'fillchars' to a space char, and clearing the
 ///                    |EndOfBuffer| region in 'winhighlight'.
-///   - `border`: style of (optional) window border. This can either be a string
-///      or an array. the string values are:
-///     - "none" No border. This is the default
-///     - "single" a single line box
-///     - "double" a double line box
-///     - "shadow" a drop shadow effect by blending with the background.
-///     If it is an array it should be an array of eight items or any divisor of
+///   - `border`: Style of (optional) window border. This can either be a string
+///      or an array. The string values are
+///     - "none": No border (default).
+///     - "single": A single line box.
+///     - "double": A double line box.
+///     - "rounded": Like "single", but with rounded corners ("╭" etc.).
+///     - "solid": Adds padding by a single whitespace cell.
+///     - "shadow": A drop shadow effect by blending with the background.
+///     - If it is an array, it should have a length of eight or any divisor of
 ///     eight. The array will specifify the eight chars building up the border
-///     in a clockwise fashion starting with the top-left corner. As, an
-///     example, the double box style could be specified as:
-///         [ "╔", "═" ,"╗", "║", "╝", "═", "╚", "║" ]
-///     if the number of chars are less than eight, they will be repeated. Thus
-///     an ASCII border could be specified as:
-///       [ "/", "-", "\\", "|" ]
-///     or all chars the same as:
-///       [ "x" ]
-///     An empty string can be used to turn off a specific border, for instance:
+///     in a clockwise fashion starting with the top-left corner. As an
+///     example, the double box style could be specified as
+///       [ "╔", "═" ,"╗", "║", "╝", "═", "╚", "║" ].
+///     If the number of chars are less than eight, they will be repeated. Thus
+///     an ASCII border could be specified as
+///       [ "/", "-", "\\", "|" ],
+///     or all chars the same as
+///       [ "x" ].
+///     An empty string can be used to turn off a specific border, for instance,
 ///       [ "", "", "", ">", "", "", "", "<" ]
 ///     will only make vertical borders but not horizontal ones.
-///     By default `FloatBorder` highlight is used which links to `VertSplit`
+///     By default, `FloatBorder` highlight is used, which links to `VertSplit`
 ///     when not defined.  It could also be specified by character:
-///       [ {"+", "MyCorner"}, {"x", "MyBorder"} ]
+///       [ {"+", "MyCorner"}, {"x", "MyBorder"} ].
+///   - `noautocmd`: If true then no buffer-related autocommand events such as
+///                  |BufEnter|, |BufLeave| or |BufWinEnter| may fire from
+///                  calling this function.
 ///
 /// @param[out] err Error details, if any
 ///
@@ -1449,7 +1474,7 @@ Window nvim_open_win(Buffer buffer, Boolean enter, Dictionary config,
   FUNC_API_CHECK_TEXTLOCK
 {
   FloatConfig fconfig = FLOAT_CONFIG_INIT;
-  if (!parse_float_config(config, &fconfig, false, err)) {
+  if (!parse_float_config(config, &fconfig, false, true, err)) {
     return 0;
   }
   win_T *wp = win_new_float(NULL, fconfig, err);
@@ -1464,7 +1489,7 @@ Window nvim_open_win(Buffer buffer, Boolean enter, Dictionary config,
     return 0;
   }
   if (buffer > 0) {
-    nvim_win_set_buf(wp->handle, buffer, err);
+    win_set_buf(wp->handle, buffer, fconfig.noautocmd, err);
   }
 
   if (fconfig.style == kWinStyleMinimal) {
@@ -2212,7 +2237,7 @@ typedef kvec_withinit_t(ExprASTConvStackItem, 16) ExprASTConvStack;
 ///          - "arg": String, error message argument.
 ///        - "len": Amount of bytes successfully parsed. With flags equal to ""
 ///                 that should be equal to the length of expr string.
-///                 (“Sucessfully parsed” here means “participated in AST
+///                 (“Successfully parsed” here means “participated in AST
 ///                  creation”, not “till the first error”.)
 ///        - "ast": AST, either nil or a dictionary with these keys:
 ///          - "type": node type, one of the value names from ExprASTNodeType
@@ -2900,7 +2925,7 @@ void nvim__screenshot(String path)
 /// Note: this function should not be called often. Rather, the callbacks
 /// themselves can be used to throttle unneeded callbacks. the `on_start`
 /// callback can return `false` to disable the provider until the next redraw.
-/// Similarily, return `false` in `on_win` will skip the `on_lines` calls
+/// Similarly, return `false` in `on_win` will skip the `on_lines` calls
 /// for that window (but any extmarks set in `on_win` will still be used).
 /// A plugin managing multiple sources of decoration should ideally only set
 /// one provider, and merge the sources internally. You can use multiple `ns_id`
@@ -2931,6 +2956,7 @@ void nvim_set_decoration_provider(Integer ns_id, DictionaryOf(LuaRef) opts,
   FUNC_API_SINCE(7) FUNC_API_LUA_ONLY
 {
   DecorProvider *p = get_decor_provider((NS)ns_id, true);
+  assert(p != NULL);
   decor_provider_clear(p);
 
   // regardless of what happens, it seems good idea to redraw

@@ -270,7 +270,7 @@ enum { FOLD_TEXT_LEN = 51 };  //!< buffer size for get_foldtext()
 /// On some systems case in a file name does not matter, on others it does.
 ///
 /// @note Does not account for maximum name lengths and things like "../dir",
-///       thus it is not 100% accurate. OS may also use different algorythm for
+///       thus it is not 100% accurate. OS may also use different algorithm for
 ///       case-insensitive comparison.
 ///
 /// @param[in]  x  First file name to compare.
@@ -313,6 +313,7 @@ enum { FOLD_TEXT_LEN = 51 };  //!< buffer size for get_foldtext()
 #define DIP_NORTP 0x20  // do not use 'runtimepath'
 #define DIP_NOAFTER 0x40  // skip "after" directories
 #define DIP_AFTER   0x80  // only use "after" directories
+#define DIP_LUA  0x100    // also use ".lua" files
 
 // Lowest number used for window ID. Cannot have this many windows per tab.
 #define LOWEST_WIN_ID 1000

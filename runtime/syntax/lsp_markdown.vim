@@ -4,12 +4,20 @@
 " URL:		http://neovim.io
 " Remark:	Uses markdown syntax file
 
-runtime! syntax/markdown.vim
+" always source the system included markdown instead of any other installed
+" markdown.vim syntax files
+execute 'source' expand('<sfile>:p:h') .. '/markdown.vim'
 
 syn cluster mkdNonListItem add=mkdEscape,mkdNbsp
 
-syntax region mkdEscape matchgroup=mkdEscape start=/\\\ze[\\\x60*{}\[\]()#+\-,.!_>~|"$%&'\/:;<=?@^ ]/ end=/.\zs/ keepend contains=mkdEscapeCh oneline concealends
-syntax match mkdEscapeCh /./ contained
+syn clear markdownEscape
+syntax region markdownEscape matchgroup=markdownEscape start=/\\\ze[\\\x60*{}\[\]()#+\-,.!_>~|"$%&'\/:;<=?@^ ]/ end=/./ containedin=ALL keepend oneline concealends
+
+" conceal html entities
 syntax match mkdNbsp /&nbsp;/ conceal cchar= 
+syntax match mkdLt /&lt;/  conceal cchar=<
+syntax match mkdGt /&gt;/  conceal cchar=>
+syntax match mkdAmp /&amp;/  conceal cchar=&
+syntax match mkdQuot /&quot;/  conceal cchar="
 
 hi def link mkdEscape special

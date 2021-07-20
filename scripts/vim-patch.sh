@@ -14,7 +14,8 @@ fi
 readonly NVIM_SOURCE_DIR="${NVIM_SOURCE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 readonly VIM_SOURCE_DIR_DEFAULT="${NVIM_SOURCE_DIR}/.vim-src"
 readonly VIM_SOURCE_DIR="${VIM_SOURCE_DIR:-${VIM_SOURCE_DIR_DEFAULT}}"
-readonly BASENAME="$(basename "${0}")"
+BASENAME="$(basename "${0}")"
+readonly BASENAME
 readonly BRANCH_PREFIX="vim-"
 
 CREATED_FILES=()
@@ -372,7 +373,7 @@ submit_pr() {
   pr_title="${pr_title// /,}" # Replace spaces with commas.
 
   local pr_message
-  pr_message="$(printf '[RFC] vim-patch:%s\n\n%s\n' "${pr_title#,}" "${pr_body}")"
+  pr_message="$(printf 'vim-patch:%s\n\n%s\n' "${pr_title#,}" "${pr_body}")"
 
   if [[ $push_first -ne 0 ]]; then
     echo "Pushing to 'origin/${checked_out_branch}'."
@@ -578,7 +579,7 @@ list_missing_previous_vimpatches_for_patch() {
   local -a fnames
   while IFS= read -r line ; do
     fnames+=("$line")
-  done < <(git -C "${VIM_SOURCE_DIR}" diff-tree --no-commit-id --name-only -r "${vim_commit}")
+  done < <(git -C "${VIM_SOURCE_DIR}" diff-tree --no-commit-id --name-only -r "${vim_commit}" -- . ':!src/version.c')
   local i=0
   local n=${#fnames[@]}
   printf '=== getting missing patches for %d files ===\n' "$n"
@@ -593,18 +594,20 @@ list_missing_previous_vimpatches_for_patch() {
     _set_missing_vimpatches 1 -- "${fname}"
 
     set +u  # Avoid "unbound variable" with bash < 4.4 below.
-    local missing_vim_commit_info="${missing_vim_patches[0]}"
-    if [[ -z "${missing_vim_commit_info}" ]]; then
-      printf -- "-\n"
-    else
-      local missing_vim_commit="${missing_vim_commit_info%%:*}"
-      if [[ -z "${vim_tag}" ]] || [[ "${missing_vim_commit}" < "${vim_tag}" ]]; then
-        printf -- "%s\n" "$missing_vim_commit_info"
-        missing_list+=("$missing_vim_commit_info")
+    for missing_vim_commit_info in "${missing_vim_patches[@]}"; do
+      if [[ -z "${missing_vim_commit_info}" ]]; then
+        printf -- "-\r"
       else
-        printf -- "-\n"
+        printf -- "-\r"
+        local missing_vim_commit="${missing_vim_commit_info%%:*}"
+        if [[ -z "${vim_tag}" ]] || [[ "${missing_vim_commit}" < "${vim_tag}" ]]; then
+          printf -- "%s\n" "$missing_vim_commit_info"
+          missing_list+=("$missing_vim_commit_info")
+        else
+          printf -- "-\r"
+        fi
       fi
-    fi
+    done
     set -u
   done
 

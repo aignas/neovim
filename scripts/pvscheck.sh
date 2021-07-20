@@ -379,7 +379,7 @@ run_analysis() {(
       --sourcetree-root . || true
 
   rm -rf PVS-studio.{xml,err,tsk,html.d}
-  local plog_args="PVS-studio.log --srcRoot . --excludedCodes V011"
+  local plog_args="PVS-studio.log --srcRoot . --excludedCodes V011,V1042"
   plog-converter $plog_args --renderTypes xml       --output PVS-studio.xml
   plog-converter $plog_args --renderTypes errorfile --output PVS-studio.err
   plog-converter $plog_args --renderTypes tasklist  --output PVS-studio.tsk
@@ -389,7 +389,7 @@ run_analysis() {(
 detect_url() {
   local url="${1:-detect}"
   if test "$url" = detect ; then
-    curl --silent -L 'https://www.viva64.com/en/pvs-studio-download/' \
+    curl --silent -L 'https://pvs-studio.com/en/pvs-studio/download-all/' \
     | grep -o 'https\{0,1\}://[^"<>]\{1,\}/pvs-studio[^/"<>]*-x86_64\.tgz' \
     || echo FAILED
   else

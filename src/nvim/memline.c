@@ -118,15 +118,15 @@ struct pointer_block {
  * etc. Thus the order of the lines is the opposite of the line number.
  */
 struct data_block {
-  uint16_t db_id;               /* ID for data block: DATA_ID */
-  unsigned db_free;             /* free space available */
-  unsigned db_txt_start;        /* byte where text starts */
-  unsigned db_txt_end;          /* byte just after data block */
-  linenr_T db_line_count;       /* number of lines in this block */
-  unsigned db_index[1];         /* index for start of line (actually bigger)
-                                 * followed by empty space upto db_txt_start
-                                 * followed by the text in the lines until
-                                 * end of page */
+  uint16_t db_id;               // ID for data block: DATA_ID
+  unsigned db_free;             // free space available
+  unsigned db_txt_start;        // byte where text starts
+  unsigned db_txt_end;          // byte just after data block
+  linenr_T db_line_count;       // number of lines in this block
+  unsigned db_index[1];         // index for start of line (actually bigger)
+                                // followed by empty space up to db_txt_start
+                                // followed by the text in the lines until
+                                // end of page
 };
 
 /*
@@ -1207,6 +1207,7 @@ void ml_recover(bool checkext)
          && !(curbuf->b_ml.ml_flags & ML_EMPTY))
     ml_delete(curbuf->b_ml.ml_line_count, false);
   curbuf->b_flags |= BF_RECOVERED;
+  check_cursor();
 
   recoverymode = FALSE;
   if (got_int)
@@ -2238,7 +2239,7 @@ static int ml_append_int(
      */
     lineadd = buf->b_ml.ml_locked_lineadd;
     buf->b_ml.ml_locked_lineadd = 0;
-    ml_find_line(buf, (linenr_T)0, ML_FLUSH);       /* flush data block */
+    (void)ml_find_line(buf, (linenr_T)0, ML_FLUSH);  // flush data block
 
     /*
      * update pointer blocks for the new data block

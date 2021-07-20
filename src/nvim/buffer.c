@@ -55,7 +55,6 @@
 #include "nvim/mark.h"
 #include "nvim/extmark.h"
 #include "nvim/mbyte.h"
-#include "nvim/memline.h"
 #include "nvim/memory.h"
 #include "nvim/message.h"
 #include "nvim/misc1.h"
@@ -84,6 +83,9 @@
 #ifdef INCLUDE_GENERATED_DECLARATIONS
 # include "buffer.c.generated.h"
 #endif
+
+// Determines how deeply nested %{} blocks will be evaluated in statusline.
+#define MAX_STL_EVAL_DEPTH 100
 
 static char *msg_loclist = N_("[Location List]");
 static char *msg_qflist = N_("[Quickfix List]");
@@ -136,7 +138,7 @@ read_buffer(
   if (read_stdin) {
     // Set or reset 'modified' before executing autocommands, so that
     // it can be changed there.
-    if (!readonlymode && !BUFEMPTY()) {
+    if (!readonlymode && !buf_is_empty(curbuf)) {
       changed();
     } else if (retval != FAIL) {
       unchanged(curbuf, false, true);
@@ -407,7 +409,8 @@ bool buf_valid(buf_T *buf)
 ///               there to be only one window with this buffer. e.g. when
 ///               ":quit" is supposed to close the window but autocommands
 ///               close all other windows.
-void close_buffer(win_T *win, buf_T *buf, int action, bool abort_if_last)
+/// @returns true when we got to the end and b_nwindows was decremented.
+bool close_buffer(win_T *win, buf_T *buf, int action, bool abort_if_last)
 {
   bool unload_buf = (action != 0);
   bool del_buf = (action == DOBUF_DEL || action == DOBUF_WIPE);
@@ -444,7 +447,7 @@ void close_buffer(win_T *win, buf_T *buf, int action, bool abort_if_last)
   // halfway a command that relies on it). Unloading is allowed.
   if (buf->b_locked > 0 && (del_buf || wipe_buf)) {
     EMSG(_("E937: Attempt to delete a buffer that is in use"));
-    return;
+    return false;
   }
 
   if (win != NULL  // Avoid bogus clang warning.
@@ -471,13 +474,13 @@ void close_buffer(win_T *win, buf_T *buf, int action, bool abort_if_last)
                        buf) && !bufref_valid(&bufref)) {
       // Autocommands deleted the buffer.
       EMSG(_(e_auabort));
-      return;
+      return false;
     }
     buf->b_locked--;
     if (abort_if_last && last_nonfloat(win)) {
       // Autocommands made this the only window.
       EMSG(_(e_auabort));
-      return;
+      return false;
     }
 
     // When the buffer becomes hidden, but is not unloaded, trigger
@@ -488,17 +491,17 @@ void close_buffer(win_T *win, buf_T *buf, int action, bool abort_if_last)
                          buf) && !bufref_valid(&bufref)) {
         // Autocommands deleted the buffer.
         EMSG(_(e_auabort));
-        return;
+        return false;
       }
       buf->b_locked--;
       if (abort_if_last && last_nonfloat(win)) {
         // Autocommands made this the only window.
         EMSG(_(e_auabort));
-        return;
+        return false;
       }
     }
     if (aborting()) {       // autocmds may abort script processing
-      return;
+      return false;
     }
   }
 
@@ -525,7 +528,7 @@ void close_buffer(win_T *win, buf_T *buf, int action, bool abort_if_last)
   /* Return when a window is displaying the buffer or when it's not
    * unloaded. */
   if (buf->b_nwindows > 0 || !unload_buf) {
-    return;
+    return false;
   }
 
   if (buf->terminal) {
@@ -561,11 +564,11 @@ void close_buffer(win_T *win, buf_T *buf, int action, bool abort_if_last)
 
   if (!bufref_valid(&bufref)) {
     // Autocommands may have deleted the buffer.
-    return;
+    return false;
   }
   if (aborting()) {
     // Autocmds may abort script processing.
-    return;
+    return false;
   }
 
   /*
@@ -576,7 +579,7 @@ void close_buffer(win_T *win, buf_T *buf, int action, bool abort_if_last)
    * deleted buffer.
    */
   if (buf == curbuf && !is_curbuf) {
-    return;
+    return false;
   }
 
   if (win != NULL  // Avoid bogus clang warning.
@@ -636,6 +639,8 @@ void close_buffer(win_T *win, buf_T *buf, int action, bool abort_if_last)
       buf->b_p_bl = false;
     }
   }
+  // NOTE: at this point "curbuf" may be invalid!
+  return true;
 }
 
 /// Make buffer not contain a file.
@@ -834,11 +839,7 @@ static void clear_wininfo(buf_T *buf)
   while (buf->b_wininfo != NULL) {
     wip = buf->b_wininfo;
     buf->b_wininfo = wip->wi_next;
-    if (wip->wi_optset) {
-      clear_winopt(&wip->wi_opt);
-      deleteFoldRecurse(buf, &wip->wi_folds);
-    }
-    xfree(wip);
+    free_wininfo(wip, buf);
   }
 }
 
@@ -899,7 +900,10 @@ void handle_swap_exists(bufref_T *old_curbuf)
     if (old_curbuf == NULL
         || !bufref_valid(old_curbuf)
         || old_curbuf->br_buf == curbuf) {
+      // Block autocommands here because curwin->w_buffer is NULL.
+      block_autocmds();
       buf = buflist_new(NULL, NULL, 1L, BLN_CURBUF | BLN_LISTED);
+      unblock_autocmds();
     } else {
       buf = old_curbuf->br_buf;
     }
@@ -1487,7 +1491,7 @@ void set_curbuf(buf_T *buf, int action)
   set_bufref(&prevbufref, prevbuf);
   set_bufref(&newbufref, buf);
 
-  // Autocommands may delete the curren buffer and/or the buffer we wan to go
+  // Autocommands may delete the curren buffer and/or the buffer we want to go
   // to.  In those cases don't close the buffer.
   if (!apply_autocmds(EVENT_BUFLEAVE, NULL, NULL, false, curbuf)
       || (bufref_valid(&prevbufref) && bufref_valid(&newbufref)
@@ -1668,7 +1672,7 @@ static int top_file_num = 1;            ///< highest file number
 
 /// Initialize b:changedtick and changedtick_val attribute
 ///
-/// @param[out]  buf  Buffer to intialize for.
+/// @param[out]  buf  Buffer to initialize for.
 static inline void buf_init_changedtick(buf_T *const buf)
   FUNC_ATTR_ALWAYS_INLINE FUNC_ATTR_NONNULL_ALL
 {
@@ -1781,7 +1785,7 @@ buf_T *buflist_new(char_u *ffname_arg, char_u *sfname_arg, linenr_T lnum,
     buf = xcalloc(1, sizeof(buf_T));
     // init b: variables
     buf->b_vars = tv_dict_alloc();
-    buf->b_signcols_max = -1;
+    buf->b_signcols_valid = false;
     init_var_dict(buf->b_vars, &buf->b_bufvar, VAR_SCOPE);
     buf_init_changedtick(buf);
   }
@@ -1844,7 +1848,7 @@ buf_T *buflist_new(char_u *ffname_arg, char_u *sfname_arg, linenr_T lnum,
       EMSG(_("W14: Warning: List of file names overflow"));
       if (emsg_silent == 0) {
         ui_flush();
-        os_delay(3000L, true);  // make sure it is noticed
+        os_delay(3001L, true);  // make sure it is noticed
       }
       top_file_num = 1;
     }
@@ -1916,7 +1920,7 @@ bool curbuf_reusable(void)
   return (curbuf != NULL
           && curbuf->b_ffname == NULL
           && curbuf->b_nwindows <= 1
-          && (curbuf->b_ml.ml_mfp == NULL || BUFEMPTY())
+          && (curbuf->b_ml.ml_mfp == NULL || buf_is_empty(curbuf))
           && !bt_quickfix(curbuf)
           && !curbufIsChanged());
 }
@@ -2056,7 +2060,7 @@ int buflist_getfile(int n, linenr_T lnum, int options, int forceit)
     // If 'switchbuf' contains "split", "vsplit" or "newtab" and the
     // current buffer isn't empty: open new tab or window
     if (wp == NULL && (swb_flags & (SWB_VSPLIT | SWB_SPLIT | SWB_NEWTAB))
-        && !BUFEMPTY()) {
+        && !buf_is_empty(curbuf)) {
       if (swb_flags & SWB_NEWTAB) {
         tabpage_new();
       } else if (win_split(0, (swb_flags & SWB_VSPLIT) ? WSP_VERT : 0)
@@ -3569,6 +3573,7 @@ int build_stl_str_hl(
   }
 
   int groupdepth = 0;
+  int evaldepth  = 0;
 
   int curitem = 0;
   bool prevchar_isflag = true;
@@ -3584,7 +3589,7 @@ int build_stl_str_hl(
 
 
   // Proceed character by character through the statusline format string
-  // fmt_p is the current positon in the input buffer
+  // fmt_p is the current position in the input buffer
   for (char_u *fmt_p = usefmt; *fmt_p; ) {
     if (curitem == (int)stl_items_len) {
         size_t new_len = stl_items_len * 3 / 2;
@@ -3906,6 +3911,13 @@ int build_stl_str_hl(
       continue;
     }
 
+    // Denotes end of expanded %{} block
+    if (*fmt_p == '}' && evaldepth > 0) {
+        fmt_p++;
+        evaldepth--;
+        continue;
+    }
+
     // An invalid item was specified.
     // Continue processing on the next character of the format string.
     if (vim_strchr(STL_ALL, *fmt_p) == NULL) {
@@ -3947,18 +3959,30 @@ int build_stl_str_hl(
     }
     case STL_VIM_EXPR:     // '{'
     {
+      char_u *block_start = fmt_p - 1;
+      int reevaluate = (*fmt_p == '%');
       itemisflag = true;
+
+      if (reevaluate) {
+        fmt_p++;
+      }
 
       // Attempt to copy the expression to evaluate into
       // the output buffer as a null-terminated string.
       char_u *t = out_p;
-      while (*fmt_p != '}' && *fmt_p != NUL && out_p < out_end_p)
+      while ((*fmt_p != '}' || (reevaluate && fmt_p[-1] != '%'))
+             && *fmt_p != NUL && out_p < out_end_p) {
         *out_p++ = *fmt_p++;
+      }
       if (*fmt_p != '}') {          // missing '}' or out of space
         break;
       }
       fmt_p++;
-      *out_p = 0;
+      if (reevaluate) {
+        out_p[-1] = 0;  // remove the % at the end of %{% expr %}
+      } else {
+        *out_p = 0;
+      }
 
       // Move our position in the output buffer
       // to the beginning of the expression
@@ -4003,6 +4027,40 @@ int build_stl_str_hl(
           XFREE_CLEAR(str);
           itemisflag = false;
         }
+      }
+
+
+      // If the output of the expression needs to be evaluated
+      // replace the %{} block with the result of evaluation
+      if (reevaluate && str != NULL && *str != 0
+          && strchr((const char *)str, '%') != NULL
+          && evaldepth < MAX_STL_EVAL_DEPTH) {
+        size_t parsed_usefmt = (size_t)(block_start - usefmt);
+        size_t str_length = strlen((const char *)str);
+        size_t fmt_length = strlen((const char *)fmt_p);
+        size_t new_fmt_len = parsed_usefmt
+          + str_length + fmt_length + 3;
+        char_u *new_fmt = (char_u *)xmalloc(new_fmt_len * sizeof(char_u));
+        char_u *new_fmt_p = new_fmt;
+
+        new_fmt_p = (char_u *)memcpy(new_fmt_p, usefmt, parsed_usefmt)
+          + parsed_usefmt;
+        new_fmt_p = (char_u *)memcpy(new_fmt_p , str, str_length)
+          + str_length;
+        new_fmt_p = (char_u *)memcpy(new_fmt_p, "%}", 2) + 2;
+        new_fmt_p = (char_u *)memcpy(new_fmt_p , fmt_p, fmt_length)
+          + fmt_length;
+        *new_fmt_p = 0;
+        new_fmt_p = NULL;
+
+        if (usefmt != fmt) {
+          xfree(usefmt);
+        }
+        XFREE_CLEAR(str);
+        usefmt = new_fmt;
+        fmt_p = usefmt + parsed_usefmt;
+        evaldepth++;
+        continue;
       }
       break;
     }
@@ -4679,7 +4737,7 @@ static bool append_arg_number(win_T *wp, char_u *buf, int buflen, bool add_file)
 // When resolving a link both "*sfname" and "*ffname" will point to the same
 // allocated memory.
 // The "*ffname" and "*sfname" pointer values on call will not be freed.
-// Note that the resulting "*ffname" pointer should be considered not allocaed.
+// Note that the resulting "*ffname" pointer should be considered not allocated.
 void fname_expand(buf_T *buf, char_u **ffname, char_u **sfname)
 {
   if (*ffname == NULL) {  // no file name given, nothing to do
@@ -4892,7 +4950,7 @@ do_arg_all(
   win_enter(lastwin, false);
   // ":tab drop file" should re-use an empty window to avoid "--remote-tab"
   // leaving an empty tab page when executed locally.
-  if (keep_tabs && BUFEMPTY() && curbuf->b_nwindows == 1
+  if (keep_tabs && buf_is_empty(curbuf) && curbuf->b_nwindows == 1
       && curbuf->b_ffname == NULL && !curbuf->b_changed) {
     use_firstwin = true;
     tab_drop_empty_window = true;
@@ -5488,16 +5546,16 @@ bool find_win_for_buf(buf_T *buf, win_T **wp, tabpage_T **tp)
 
 int buf_signcols(buf_T *buf)
 {
-    if (buf->b_signcols_max == -1) {
+    if (!buf->b_signcols_valid) {
         sign_entry_T *sign;  // a sign in the sign list
-        buf->b_signcols_max = 0;
+        int signcols = 0;
         int linesum = 0;
         linenr_T curline = 0;
 
         FOR_ALL_SIGNS_IN_BUF(buf, sign) {
           if (sign->se_lnum > curline) {
-            if (linesum > buf->b_signcols_max) {
-              buf->b_signcols_max = linesum;
+            if (linesum > signcols) {
+              signcols = linesum;
             }
             curline = sign->se_lnum;
             linesum = 0;
@@ -5506,15 +5564,17 @@ int buf_signcols(buf_T *buf)
             linesum++;
           }
         }
-        if (linesum > buf->b_signcols_max) {
-          buf->b_signcols_max = linesum;
+        if (linesum > signcols) {
+          signcols = linesum;
         }
 
         // Check if we need to redraw
-        if (buf->b_signcols_max != buf->b_signcols) {
-            buf->b_signcols = buf->b_signcols_max;
+        if (signcols != buf->b_signcols) {
+            buf->b_signcols = signcols;
             redraw_buf_later(buf, NOT_VALID);
         }
+
+        buf->b_signcols_valid = true;
     }
 
     return buf->b_signcols;
@@ -5605,7 +5665,7 @@ bool buf_contents_changed(buf_T *buf)
 void
 wipe_buffer(
     buf_T *buf,
-    int aucmd                   // When true trigger autocommands.
+    bool aucmd                  // When true trigger autocommands.
 )
 {
   if (!aucmd) {
@@ -5635,3 +5695,4 @@ void buf_open_scratch(handle_T bufnr, char *bufname)
   set_option_value("swf", 0L, NULL, OPT_LOCAL);
   RESET_BINDING(curwin);
 }
+

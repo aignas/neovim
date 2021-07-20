@@ -603,6 +603,31 @@ describe('lua stdlib', function()
       return vim.tbl_islist(c) and count == 0
     ]]))
 
+    eq(exec_lua([[
+      local a = { a = { b = 1 } }
+      local b = { a = {} }
+      return vim.tbl_deep_extend("force", a, b)
+    ]]), {a = {b = 1}})
+
+    eq(exec_lua([[
+      local a = { a = 123 }
+      local b = { a = { b = 1} }
+      return vim.tbl_deep_extend("force", a, b)
+    ]]), {a = {b = 1}})
+
+    ok(exec_lua([[
+      local a = { a = {[2] = 3} }
+      local b = { a = {[3] = 3} }
+      local c = vim.tbl_deep_extend("force", a, b)
+      return vim.deep_equal(c, {a = {[3] = 3}})
+    ]]))
+
+    eq(exec_lua([[
+      local a = { a = { b = 1} }
+      local b = { a = 123 }
+      return vim.tbl_deep_extend("force", a, b)
+    ]]), {a = 123 })
+
     eq('Error executing lua: vim/shared.lua:0: invalid "behavior": nil',
       pcall_err(exec_lua, [[
         return vim.tbl_deep_extend()
@@ -945,12 +970,20 @@ describe('lua stdlib', function()
     exec_lua [[
     vim.api.nvim_set_var("testing", "hi")
     vim.api.nvim_set_var("other", 123)
+    vim.api.nvim_set_var("floaty", 5120.1)
+    vim.api.nvim_set_var("nullvar", vim.NIL)
     vim.api.nvim_set_var("to_delete", {hello="world"})
     ]]
 
     eq('hi', funcs.luaeval "vim.g.testing")
     eq(123, funcs.luaeval "vim.g.other")
+    eq(5120.1, funcs.luaeval "vim.g.floaty")
     eq(NIL, funcs.luaeval "vim.g.nonexistant")
+    eq(NIL, funcs.luaeval "vim.g.nullvar")
+    -- lost over RPC, so test locally:
+    eq({false, true}, exec_lua [[
+      return {vim.g.nonexistant == vim.NIL, vim.g.nullvar == vim.NIL}
+    ]])
 
     eq({hello="world"}, funcs.luaeval "vim.g.to_delete")
     exec_lua [[
@@ -963,12 +996,20 @@ describe('lua stdlib', function()
     exec_lua [[
     vim.api.nvim_buf_set_var(0, "testing", "hi")
     vim.api.nvim_buf_set_var(0, "other", 123)
+    vim.api.nvim_buf_set_var(0, "floaty", 5120.1)
+    vim.api.nvim_buf_set_var(0, "nullvar", vim.NIL)
     vim.api.nvim_buf_set_var(0, "to_delete", {hello="world"})
     ]]
 
     eq('hi', funcs.luaeval "vim.b.testing")
     eq(123, funcs.luaeval "vim.b.other")
+    eq(5120.1, funcs.luaeval "vim.b.floaty")
     eq(NIL, funcs.luaeval "vim.b.nonexistant")
+    eq(NIL, funcs.luaeval "vim.b.nullvar")
+    -- lost over RPC, so test locally:
+    eq({false, true}, exec_lua [[
+      return {vim.b.nonexistant == vim.NIL, vim.b.nullvar == vim.NIL}
+    ]])
 
     eq({hello="world"}, funcs.luaeval "vim.b.to_delete")
     exec_lua [[
@@ -1096,6 +1137,710 @@ describe('lua stdlib', function()
     ]]
     eq(0, funcs.luaeval "vim.wo[1000].cole")
   end)
+
+  describe('vim.opt', function()
+    -- TODO: We still need to write some tests for optlocal, opt and then getting the options
+    --  Probably could also do some stuff with getting things from viml side as well to confirm behavior is the same.
+
+    it('should allow setting number values', function()
+      local scrolloff = exec_lua [[
+        vim.opt.scrolloff = 10
+        return vim.o.scrolloff
+      ]]
+      eq(scrolloff, 10)
+    end)
+
+    pending('should handle STUPID window things', function()
+      local result = exec_lua [[
+        local result = {}
+
+        table.insert(result, vim.api.nvim_get_option('scrolloff'))
+        table.insert(result, vim.api.nvim_win_get_option(0, 'scrolloff'))
+
+        return result
+      ]]
+
+      eq({}, result)
+    end)
+
+    it('should allow setting tables', function()
+      local wildignore = exec_lua [[
+        vim.opt.wildignore = { 'hello', 'world' }
+        return vim.o.wildignore
+      ]]
+      eq(wildignore, "hello,world")
+    end)
+
+    it('should allow setting tables with shortnames', function()
+      local wildignore = exec_lua [[
+        vim.opt.wig = { 'hello', 'world' }
+        return vim.o.wildignore
+      ]]
+      eq(wildignore, "hello,world")
+    end)
+
+    it('should error when you attempt to set string values to numeric options', function()
+      local result = exec_lua [[
+        return {
+          pcall(function() vim.opt.textwidth = 'hello world' end)
+        }
+      ]]
+
+      eq(false, result[1])
+    end)
+
+    it('should error when you attempt to setlocal a global value', function()
+      local result = exec_lua [[
+        return pcall(function() vim.opt_local.clipboard = "hello" end)
+      ]]
+
+      eq(false, result)
+    end)
+
+    it('should allow you to set boolean values', function()
+      eq({true, false, true}, exec_lua [[
+        local results = {}
+
+        vim.opt.autoindent = true
+        table.insert(results, vim.bo.autoindent)
+
+        vim.opt.autoindent = false
+        table.insert(results, vim.bo.autoindent)
+
+        vim.opt.autoindent = not vim.opt.autoindent:get()
+        table.insert(results, vim.bo.autoindent)
+
+        return results
+      ]])
+    end)
+
+    it('should change current buffer values and defaults for global local values', function()
+      local result = exec_lua [[
+        local result = {}
+
+        vim.opt.makeprg = "global-local"
+        table.insert(result, vim.api.nvim_get_option('makeprg'))
+        table.insert(result, (pcall(vim.api.nvim_buf_get_option, 0, 'makeprg')))
+
+        vim.opt_local.mp = "only-local"
+        table.insert(result, vim.api.nvim_get_option('makeprg'))
+        table.insert(result, vim.api.nvim_buf_get_option(0, 'makeprg'))
+
+        vim.opt_global.makeprg = "only-global"
+        table.insert(result, vim.api.nvim_get_option('makeprg'))
+        table.insert(result, vim.api.nvim_buf_get_option(0, 'makeprg'))
+
+        vim.opt.makeprg = "global-local"
+        table.insert(result, vim.api.nvim_get_option('makeprg'))
+        table.insert(result, vim.api.nvim_buf_get_option(0, 'makeprg'))
+        return result
+      ]]
+
+      -- Set -> global & local
+      eq("global-local", result[1])
+      eq(false, result[2])
+
+      -- Setlocal -> only local
+      eq("global-local", result[3])
+      eq("only-local", result[4])
+
+      -- Setglobal -> only global
+      eq("only-global", result[5])
+      eq("only-local", result[6])
+
+      -- set -> doesn't override previously set value
+      eq("global-local", result[7])
+      eq("only-local", result[8])
+    end)
+
+    it('should allow you to retrieve window opts even if they have not been set', function()
+      local result = exec_lua [[
+        local result = {}
+        table.insert(result, vim.opt.number:get())
+        table.insert(result, vim.opt_local.number:get())
+
+        vim.opt_local.number = true
+        table.insert(result, vim.opt.number:get())
+        table.insert(result, vim.opt_local.number:get())
+
+        return result
+      ]]
+      eq({false, false, true, true}, result)
+    end)
+
+    it('should allow all sorts of string manipulation', function()
+      eq({'hello', 'hello world', 'start hello world'}, exec_lua [[
+        local results = {}
+
+        vim.opt.makeprg = "hello"
+        table.insert(results, vim.o.makeprg)
+
+        vim.opt.makeprg = vim.opt.makeprg + " world"
+        table.insert(results, vim.o.makeprg)
+
+        vim.opt.makeprg = vim.opt.makeprg ^ "start "
+        table.insert(results, vim.o.makeprg)
+
+        return results
+      ]])
+    end)
+
+    describe('option:get()', function()
+      it('should work for boolean values', function()
+        eq(false, exec_lua [[
+          vim.opt.number = false
+          return vim.opt.number:get()
+        ]])
+      end)
+
+      it('should work for number values', function()
+        local tabstop = exec_lua[[
+          vim.opt.tabstop = 10
+          return vim.opt.tabstop:get()
+        ]]
+
+        eq(10, tabstop)
+      end)
+
+      it('should work for string values', function()
+        eq("hello world", exec_lua [[
+          vim.opt.makeprg = "hello world"
+          return vim.opt.makeprg:get()
+        ]])
+      end)
+
+      it('should work for set type flaglists', function()
+        local formatoptions = exec_lua [[
+          vim.opt.formatoptions = 'tcro'
+          return vim.opt.formatoptions:get()
+        ]]
+
+        eq(true, formatoptions.t)
+        eq(true, not formatoptions.q)
+      end)
+
+      it('should work for set type flaglists', function()
+        local formatoptions = exec_lua [[
+          vim.opt.formatoptions = { t = true, c = true, r = true, o = true }
+          return vim.opt.formatoptions:get()
+        ]]
+
+        eq(true, formatoptions.t)
+        eq(true, not formatoptions.q)
+      end)
+
+      it('should work for array list type options', function()
+        local wildignore = exec_lua [[
+          vim.opt.wildignore = "*.c,*.o,__pycache__"
+          return vim.opt.wildignore:get()
+        ]]
+
+        eq(3, #wildignore)
+        eq("*.c", wildignore[1])
+      end)
+
+      it('should work for options that are both commalist and flaglist', function()
+        local result = exec_lua [[
+          vim.opt.whichwrap = "b,s"
+          return vim.opt.whichwrap:get()
+        ]]
+
+        eq({b = true, s = true}, result)
+
+        result = exec_lua [[
+          vim.opt.whichwrap = { b = true, s = false, h = true }
+          return vim.opt.whichwrap:get()
+        ]]
+
+        eq({b = true, h = true}, result)
+      end)
+
+      it('should work for key-value pair options', function()
+        local listchars = exec_lua [[
+          vim.opt.listchars = "tab:> ,space:_"
+          return vim.opt.listchars:get()
+        ]]
+
+        eq({
+          tab = "> ",
+          space = "_",
+        }, listchars)
+      end)
+
+      it('should allow you to add numeric options', function()
+        eq(16, exec_lua [[
+          vim.opt.tabstop = 12
+          vim.opt.tabstop = vim.opt.tabstop + 4
+          return vim.bo.tabstop
+        ]])
+      end)
+
+      it('should allow you to subtract numeric options', function()
+        eq(2, exec_lua [[
+          vim.opt.tabstop = 4
+          vim.opt.tabstop = vim.opt.tabstop - 2
+          return vim.bo.tabstop
+        ]])
+      end)
+    end)
+
+    describe('key:value style options', function()
+      it('should handle dictionary style', function()
+        local listchars = exec_lua [[
+          vim.opt.listchars = {
+            eol = "~",
+            space = ".",
+          }
+
+          return vim.o.listchars
+        ]]
+        eq("eol:~,space:.", listchars)
+      end)
+
+      it('should allow adding dictionary style', function()
+        local listchars = exec_lua [[
+          vim.opt.listchars = {
+            eol = "~",
+            space = ".",
+          }
+
+          vim.opt.listchars = vim.opt.listchars + { space = "-" }
+
+          return vim.o.listchars
+        ]]
+
+        eq("eol:~,space:-", listchars)
+      end)
+
+      it('should allow adding dictionary style', function()
+        local listchars = exec_lua [[
+          vim.opt.listchars = {
+            eol = "~",
+            space = ".",
+          }
+          vim.opt.listchars = vim.opt.listchars + { space = "-" } + { space = "_" }
+
+          return vim.o.listchars
+        ]]
+
+        eq("eol:~,space:_", listchars)
+      end)
+
+      it('should allow completely new keys', function()
+        local listchars = exec_lua [[
+          vim.opt.listchars = {
+            eol = "~",
+            space = ".",
+          }
+          vim.opt.listchars = vim.opt.listchars + { tab = ">>>" }
+
+          return vim.o.listchars
+        ]]
+
+        eq("eol:~,space:.,tab:>>>", listchars)
+      end)
+
+      it('should allow subtracting dictionary style', function()
+        local listchars = exec_lua [[
+          vim.opt.listchars = {
+            eol = "~",
+            space = ".",
+          }
+          vim.opt.listchars = vim.opt.listchars - "space"
+
+          return vim.o.listchars
+        ]]
+
+        eq("eol:~", listchars)
+      end)
+
+      it('should allow subtracting dictionary style', function()
+        local listchars = exec_lua [[
+          vim.opt.listchars = {
+            eol = "~",
+            space = ".",
+          }
+          vim.opt.listchars = vim.opt.listchars - "space" - "eol"
+
+          return vim.o.listchars
+        ]]
+
+        eq("", listchars)
+      end)
+
+      it('should allow subtracting dictionary style multiple times', function()
+        local listchars = exec_lua [[
+          vim.opt.listchars = {
+            eol = "~",
+            space = ".",
+          }
+          vim.opt.listchars = vim.opt.listchars - "space" - "space"
+
+          return vim.o.listchars
+        ]]
+
+        eq("eol:~", listchars)
+      end)
+
+      it('should allow adding a key:value string to a listchars', function()
+        local listchars = exec_lua [[
+          vim.opt.listchars = {
+            eol = "~",
+            space = ".",
+          }
+          vim.opt.listchars = vim.opt.listchars + "tab:>~"
+
+          return vim.o.listchars
+        ]]
+
+        eq("eol:~,space:.,tab:>~", listchars)
+      end)
+
+      it('should allow prepending a key:value string to a listchars', function()
+        local listchars = exec_lua [[
+          vim.opt.listchars = {
+            eol = "~",
+            space = ".",
+          }
+          vim.opt.listchars = vim.opt.listchars ^ "tab:>~"
+
+          return vim.o.listchars
+        ]]
+
+        eq("eol:~,space:.,tab:>~", listchars)
+      end)
+    end)
+
+    it('should automatically set when calling remove', function()
+      eq("foo,baz", exec_lua [[
+        vim.opt.wildignore = "foo,bar,baz"
+        vim.opt.wildignore:remove("bar")
+
+        return vim.o.wildignore
+      ]])
+    end)
+
+    it('should automatically set when calling remove with a table', function()
+      eq("foo", exec_lua [[
+        vim.opt.wildignore = "foo,bar,baz"
+        vim.opt.wildignore:remove { "bar", "baz" }
+
+        return vim.o.wildignore
+      ]])
+    end)
+
+    it('should automatically set when calling append', function()
+      eq("foo,bar,baz,bing", exec_lua [[
+        vim.opt.wildignore = "foo,bar,baz"
+        vim.opt.wildignore:append("bing")
+
+        return vim.o.wildignore
+      ]])
+    end)
+
+    it('should automatically set when calling append with a table', function()
+      eq("foo,bar,baz,bing,zap", exec_lua [[
+        vim.opt.wildignore = "foo,bar,baz"
+        vim.opt.wildignore:append { "bing", "zap" }
+
+        return vim.o.wildignore
+      ]])
+    end)
+
+    it('should allow adding tables', function()
+      local wildignore = exec_lua [[
+        vim.opt.wildignore = 'foo'
+        return vim.o.wildignore
+      ]]
+      eq(wildignore, 'foo')
+
+      wildignore = exec_lua [[
+        vim.opt.wildignore = vim.opt.wildignore + { 'bar', 'baz' }
+        return vim.o.wildignore
+      ]]
+      eq(wildignore, 'foo,bar,baz')
+    end)
+
+    it('should handle adding duplicates', function()
+      local wildignore = exec_lua [[
+        vim.opt.wildignore = 'foo'
+        return vim.o.wildignore
+      ]]
+      eq(wildignore, 'foo')
+
+      wildignore = exec_lua [[
+        vim.opt.wildignore = vim.opt.wildignore + { 'bar', 'baz' }
+        return vim.o.wildignore
+      ]]
+      eq(wildignore, 'foo,bar,baz')
+
+      wildignore = exec_lua [[
+        vim.opt.wildignore = vim.opt.wildignore + { 'bar', 'baz' }
+        return vim.o.wildignore
+      ]]
+      eq(wildignore, 'foo,bar,baz')
+    end)
+
+    it('should allow adding multiple times', function()
+      local wildignore = exec_lua [[
+        vim.opt.wildignore = 'foo'
+        vim.opt.wildignore = vim.opt.wildignore + 'bar' + 'baz'
+        return vim.o.wildignore
+      ]]
+      eq(wildignore, 'foo,bar,baz')
+    end)
+
+    it('should remove values when you use minus', function()
+      local wildignore = exec_lua [[
+        vim.opt.wildignore = 'foo'
+        return vim.o.wildignore
+      ]]
+      eq(wildignore, 'foo')
+
+      wildignore = exec_lua [[
+        vim.opt.wildignore = vim.opt.wildignore + { 'bar', 'baz' }
+        return vim.o.wildignore
+      ]]
+      eq(wildignore, 'foo,bar,baz')
+
+      wildignore = exec_lua [[
+        vim.opt.wildignore = vim.opt.wildignore - 'bar'
+        return vim.o.wildignore
+      ]]
+      eq(wildignore, 'foo,baz')
+    end)
+
+    it('should prepend values when using ^', function()
+      local wildignore = exec_lua [[
+        vim.opt.wildignore = 'foo'
+        vim.opt.wildignore = vim.opt.wildignore ^ 'first'
+        return vim.o.wildignore
+      ]]
+      eq('first,foo', wildignore)
+
+      wildignore = exec_lua [[
+        vim.opt.wildignore = vim.opt.wildignore ^ 'super_first'
+        return vim.o.wildignore
+      ]]
+      eq(wildignore, 'super_first,first,foo')
+    end)
+
+    it('should not remove duplicates from wildmode: #14708', function()
+      local wildmode = exec_lua [[
+        vim.opt.wildmode = {"full", "list", "full"}
+        return vim.o.wildmode
+      ]]
+
+      eq(wildmode, 'full,list,full')
+    end)
+
+    describe('option types', function()
+      it('should allow to set option with numeric value', function()
+        eq(4, exec_lua [[
+          vim.opt.tabstop = 4
+          return vim.bo.tabstop
+        ]])
+
+        matches("Invalid option type 'string' for 'tabstop'", pcall_err(exec_lua, [[
+          vim.opt.tabstop = '4'
+        ]]))
+        matches("Invalid option type 'boolean' for 'tabstop'", pcall_err(exec_lua, [[
+          vim.opt.tabstop = true
+        ]]))
+        matches("Invalid option type 'table' for 'tabstop'", pcall_err(exec_lua, [[
+          vim.opt.tabstop = {4, 2}
+        ]]))
+        matches("Invalid option type 'function' for 'tabstop'", pcall_err(exec_lua, [[
+          vim.opt.tabstop = function()
+            return 4
+          end
+        ]]))
+      end)
+
+      it('should allow to set option with boolean value', function()
+        eq(true, exec_lua [[
+          vim.opt.undofile = true
+          return vim.bo.undofile
+        ]])
+
+        matches("Invalid option type 'number' for 'undofile'", pcall_err(exec_lua, [[
+          vim.opt.undofile = 0
+        ]]))
+        matches("Invalid option type 'table' for 'undofile'", pcall_err(exec_lua, [[
+          vim.opt.undofile = {true}
+        ]]))
+        matches("Invalid option type 'string' for 'undofile'", pcall_err(exec_lua, [[
+          vim.opt.undofile = 'true'
+        ]]))
+        matches("Invalid option type 'function' for 'undofile'", pcall_err(exec_lua, [[
+          vim.opt.undofile = function()
+            return true
+          end
+        ]]))
+      end)
+
+      it('should allow to set option with array or string value', function()
+        eq('indent,eol,start', exec_lua [[
+          vim.opt.backspace = {'indent','eol','start'}
+          return vim.go.backspace
+        ]])
+        eq('indent,eol,start', exec_lua [[
+          vim.opt.backspace = 'indent,eol,start'
+          return vim.go.backspace
+        ]])
+
+        matches("Invalid option type 'boolean' for 'backspace'", pcall_err(exec_lua, [[
+          vim.opt.backspace = true
+        ]]))
+        matches("Invalid option type 'number' for 'backspace'", pcall_err(exec_lua, [[
+          vim.opt.backspace = 2
+        ]]))
+        matches("Invalid option type 'function' for 'backspace'", pcall_err(exec_lua, [[
+          vim.opt.backspace = function()
+            return 'indent,eol,start'
+          end
+        ]]))
+      end)
+
+      it('should allow set option with map or string value', function()
+        eq("eol:~,space:.", exec_lua [[
+          vim.opt.listchars = {
+            eol = "~",
+            space = ".",
+          }
+          return vim.o.listchars
+        ]])
+        eq("eol:~,space:.,tab:>~", exec_lua [[
+          vim.opt.listchars = "eol:~,space:.,tab:>~"
+          return vim.o.listchars
+        ]])
+
+        matches("Invalid option type 'boolean' for 'listchars'", pcall_err(exec_lua, [[
+          vim.opt.listchars = true
+        ]]))
+        matches("Invalid option type 'number' for 'listchars'", pcall_err(exec_lua, [[
+          vim.opt.listchars = 2
+        ]]))
+        matches("Invalid option type 'function' for 'listchars'", pcall_err(exec_lua, [[
+          vim.opt.listchars = function()
+            return "eol:~,space:.,tab:>~"
+          end
+        ]]))
+      end)
+
+      it('should allow set option with set or string value', function()
+        local ww = exec_lua [[
+          vim.opt.whichwrap = {
+            b = true,
+            s = 1,
+          }
+          return vim.go.whichwrap
+        ]]
+
+        eq(ww, "b,s")
+        eq("b,s,<,>,[,]", exec_lua [[
+          vim.opt.whichwrap = "b,s,<,>,[,]"
+          return vim.go.whichwrap
+        ]])
+
+        matches("Invalid option type 'boolean' for 'whichwrap'", pcall_err(exec_lua, [[
+          vim.opt.whichwrap = true
+        ]]))
+        matches("Invalid option type 'number' for 'whichwrap'", pcall_err(exec_lua, [[
+          vim.opt.whichwrap = 2
+        ]]))
+        matches("Invalid option type 'function' for 'whichwrap'", pcall_err(exec_lua, [[
+          vim.opt.whichwrap = function()
+            return "b,s,<,>,[,]"
+          end
+        ]]))
+      end)
+    end)
+
+    -- isfname=a,b,c,,,d,e,f
+    it('can handle isfname ,,,', function()
+      local result = exec_lua [[
+        vim.opt.isfname = "a,b,,,c"
+        return { vim.opt.isfname:get(), vim.api.nvim_get_option('isfname') }
+      ]]
+
+      eq({{",", "a", "b", "c"}, "a,b,,,c"}, result)
+    end)
+
+    -- isfname=a,b,c,^,,def
+    it('can handle isfname ,^,,', function()
+      local result = exec_lua [[
+        vim.opt.isfname = "a,b,^,,c"
+        return { vim.opt.isfname:get(), vim.api.nvim_get_option('isfname') }
+      ]]
+
+      eq({{"^,", "a", "b", "c"}, "a,b,^,,c"}, result)
+    end)
+
+
+
+    describe('https://github.com/neovim/neovim/issues/14828', function()
+      it('gives empty list when item is empty:array', function()
+        eq({}, exec_lua [[
+          vim.cmd("set wildignore=")
+          return vim.opt.wildignore:get()
+        ]])
+
+        eq({}, exec_lua [[
+          vim.opt.wildignore = {}
+          return vim.opt.wildignore:get()
+        ]])
+      end)
+
+      it('gives empty list when item is empty:set', function()
+        eq({}, exec_lua [[
+          vim.cmd("set formatoptions=")
+          return vim.opt.formatoptions:get()
+        ]])
+
+        eq({}, exec_lua [[
+          vim.opt.formatoptions = {}
+          return vim.opt.formatoptions:get()
+        ]])
+      end)
+
+      it('does not append to empty item', function()
+        eq({"*.foo", "*.bar"},  exec_lua [[
+          vim.opt.wildignore = {}
+          vim.opt.wildignore:append { "*.foo", "*.bar" }
+
+          return vim.opt.wildignore:get()
+        ]])
+      end)
+
+      it('does not prepend to empty item', function()
+        eq({"*.foo", "*.bar"},  exec_lua [[
+          vim.opt.wildignore = {}
+          vim.opt.wildignore:prepend { "*.foo", "*.bar" }
+
+          return vim.opt.wildignore:get()
+        ]])
+      end)
+
+      it('append to empty set', function()
+        eq({ t = true },  exec_lua [[
+          vim.opt.formatoptions = {}
+          vim.opt.formatoptions:append("t")
+
+          return vim.opt.formatoptions:get()
+        ]])
+      end)
+
+      it('prepend to empty set', function()
+        eq({ t = true },  exec_lua [[
+          vim.opt.formatoptions = {}
+          vim.opt.formatoptions:prepend("t")
+
+          return vim.opt.formatoptions:get()
+        ]])
+      end)
+    end)
+  end) -- vim.opt
 
   it('vim.cmd', function()
     exec_lua [[
@@ -1455,6 +2200,34 @@ describe('lua stdlib', function()
       eq(true, meths.buf_get_option(buf2, 'autoindent'))
       eq(buf1, meths.get_current_buf())
       eq(buf2, val)
+    end)
+  end)
+
+  describe('vim.api.nvim_win_call', function()
+    it('can access window options', function()
+      command('vsplit')
+      local win1 = meths.get_current_win()
+      command('wincmd w')
+      local win2 = exec_lua [[
+        win2 = vim.api.nvim_get_current_win()
+        return win2
+      ]]
+      command('wincmd p')
+
+      eq('', meths.win_get_option(win1, 'winhighlight'))
+      eq('', meths.win_get_option(win2, 'winhighlight'))
+
+      local val = exec_lua [[
+        return vim.api.nvim_win_call(win2, function()
+          vim.cmd "setlocal winhighlight=Normal:Normal"
+          return vim.api.nvim_get_current_win()
+        end)
+      ]]
+
+      eq('', meths.win_get_option(win1, 'winhighlight'))
+      eq('Normal:Normal', meths.win_get_option(win2, 'winhighlight'))
+      eq(win1, meths.get_current_win())
+      eq(win2, val)
     end)
   end)
 end)

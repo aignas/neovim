@@ -10,14 +10,14 @@ local log = {}
 -- Can be used to lookup the number from the name or the name from the number.
 -- Levels by name: 'trace', 'debug', 'info', 'warn', 'error'
 -- Level numbers begin with 'trace' at 0
-log.levels = vim.log.levels
+log.levels = vim.deepcopy(vim.log.levels)
 
 -- Default log level is warn.
 local current_log_level = log.levels.WARN
 local log_date_format = "%FT%H:%M:%S%z"
 
 do
-  local path_sep = vim.loop.os_uname().sysname == "Windows" and "\\" or "/"
+  local path_sep = vim.loop.os_uname().version:match("Windows") and "\\" or "/"
   --@private
   local function path_join(...)
     return table.concat(vim.tbl_flatten{...}, path_sep)

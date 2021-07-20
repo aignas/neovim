@@ -7,8 +7,6 @@
 #include <string.h>
 #include <stdbool.h>
 
-#include <lua.h>
-#include <lauxlib.h>
 #include <msgpack.h>
 
 #include "nvim/ascii.h"
@@ -258,6 +256,8 @@ int main(int argc, char **argv)
   // Check if we have an interactive window.
   check_and_set_isatty(&params);
 
+  nlua_init();
+
   // Process the command line arguments.  File names are put in the global
   // argument list "global_alist".
   command_line_scan(&params);
@@ -341,7 +341,6 @@ int main(int argc, char **argv)
     TIME_MSG("initialized screen early for UI");
   }
 
-
   // open terminals when opening files that start with term://
 #define PROTO "term://"
   do_cmdline_cmd("augroup nvim_terminal");
@@ -375,7 +374,7 @@ int main(int argc, char **argv)
     // Does ":filetype plugin indent on".
     filetype_maybe_enable();
     // Sources syntax/syntax.vim, which calls `:filetype on`.
-    syn_maybe_on();
+    syn_maybe_enable();
   }
 
   // Read all the plugin files.
@@ -1101,11 +1100,7 @@ static void command_line_scan(mparm_T *parmp)
 
               size_t s_size = STRLEN(a) + 9;
               char *s = xmalloc(s_size);
-              if (path_with_extension(a, "lua")) {
-                snprintf(s, s_size, "luafile %s", a);
-              } else {
-                snprintf(s, s_size, "so %s", a);
-              }
+              snprintf(s, s_size, "so %s", a);
               parmp->cmds_tofree[parmp->n_commands] = true;
               parmp->commands[parmp->n_commands++] = s;
             } else {
@@ -1367,7 +1362,8 @@ static void load_plugins(void)
 {
   if (p_lpl) {
     char_u *rtp_copy = NULL;
-    char_u *const plugin_pattern = (char_u *)"plugin/**/*.vim";  // NOLINT
+    char_u *const plugin_pattern_vim = (char_u *)"plugin/**/*.vim";  // NOLINT
+    char_u *const plugin_pattern_lua = (char_u *)"plugin/**/*.lua";  // NOLINT
 
     // First add all package directories to 'runtimepath', so that their
     // autoload directories can be found.  Only if not done already with a
@@ -1380,7 +1376,10 @@ static void load_plugins(void)
     }
 
     source_in_path(rtp_copy == NULL ? p_rtp : rtp_copy,
-                   plugin_pattern,
+                   plugin_pattern_vim,
+                   DIP_ALL | DIP_NOAFTER);
+    source_in_path(rtp_copy == NULL ? p_rtp : rtp_copy,
+                   plugin_pattern_lua,
                    DIP_ALL | DIP_NOAFTER);
     TIME_MSG("loading plugins");
     xfree(rtp_copy);
@@ -1392,7 +1391,8 @@ static void load_plugins(void)
     }
     TIME_MSG("loading packages");
 
-    source_runtime(plugin_pattern, DIP_ALL | DIP_AFTER);
+    source_runtime(plugin_pattern_vim, DIP_ALL | DIP_AFTER);
+    source_runtime(plugin_pattern_lua, DIP_ALL | DIP_AFTER);
     TIME_MSG("loading after plugins");
   }
 }
@@ -1443,11 +1443,9 @@ static void read_stdin(void)
   no_wait_return = true;
   int save_msg_didany = msg_didany;
   set_buflisted(true);
-
   // Create memfile and read from stdin.
   (void)open_buffer(true, NULL, 0);
-
-  if (BUFEMPTY() && curbuf->b_next != NULL) {
+  if (buf_is_empty(curbuf) && curbuf->b_next != NULL) {
     // stdin was empty, go to buffer 2 (e.g. "echo file1 | xargs nvim"). #8561
     do_cmdline_cmd("silent! bnext");
     // Delete the empty stdin buffer.
@@ -1810,12 +1808,13 @@ static bool do_user_initialization(void)
 
   char_u *init_lua_path = (char_u *)stdpaths_user_conf_subpath("init.lua");
   if (os_path_exists(init_lua_path)
-      && nlua_exec_file((const char *)init_lua_path)) {
+      && do_source(init_lua_path, true, DOSO_VIMRC)) {
     os_setenv("MYVIMRC", (const char *)init_lua_path, 1);
     char_u *vimrc_path = (char_u *)stdpaths_user_conf_subpath("init.vim");
 
     if (os_path_exists(vimrc_path)) {
-      EMSG3(_("Conflicting configs: \"%s\" \"%s\""), init_lua_path, vimrc_path);
+      EMSG3(_("E5422: Conflicting configs: \"%s\" \"%s\""), init_lua_path,
+            vimrc_path);
     }
 
     xfree(vimrc_path);
@@ -1883,12 +1882,8 @@ static void source_startup_scripts(const mparm_T *const parmp)
         || strequal(parmp->use_vimrc, "NORC")) {
       // Do nothing.
     } else {
-      if (path_with_extension(parmp->use_vimrc, "lua")) {
-        nlua_exec_file(parmp->use_vimrc);
-      } else {
-        if (do_source((char_u *)parmp->use_vimrc, false, DOSO_NONE) != OK) {
-          EMSG2(_("E282: Cannot read from \"%s\""), parmp->use_vimrc);
-        }
+      if (do_source((char_u *)parmp->use_vimrc, false, DOSO_NONE) != OK) {
+        EMSG2(_("E282: Cannot read from \"%s\""), parmp->use_vimrc);
       }
     }
   } else if (!silent_mode) {

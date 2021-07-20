@@ -1186,9 +1186,12 @@ static void win_update(win_T *wp, Providers *providers)
 
         getvcols(wp, &VIsual, &curwin->w_cursor, &fromc, &toc);
         ve_flags = save_ve_flags;
-        ++toc;
-        if (curwin->w_curswant == MAXCOL)
+        toc++;
+        // Highlight to the end of the line, unless 'virtualedit' has
+        // "block".
+        if (curwin->w_curswant == MAXCOL && !(ve_flags & VE_BLOCK)) {
           toc = MAXCOL;
+        }
 
         if (fromc != wp->w_old_cursor_fcol
             || toc != wp->w_old_cursor_lcol) {
@@ -1709,7 +1712,7 @@ static void win_update(win_T *wp, Providers *providers)
           && (wp->w_valid & (VALID_WCOL|VALID_WROW))
           != (VALID_WCOL|VALID_WROW)) {
         // A win_line() call applied a fix to screen cursor column to
-        // accomodate concealment of cursor line, but in this call to
+        // accommodate concealment of cursor line, but in this call to
         // update_topline() the cursor's row or column got invalidated.
         // If they are left invalid, setcursor() will recompute them
         // but there won't be any further win_line() call to re-fix the
@@ -2003,7 +2006,7 @@ static int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow,
   char_u      *line;                  // current line
   char_u      *ptr;                   // current position in "line"
   int row;                            // row in the window, excl w_winrow
-  ScreenGrid *grid = &wp->w_grid;     // grid specfic to the window
+  ScreenGrid *grid = &wp->w_grid;     // grid specific to the window
 
   char_u extra[57];                   // sign, line number and 'fdc' must
                                       // fit in here
@@ -2101,6 +2104,7 @@ static int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow,
   bool search_attr_from_match = false;  // if search_attr is from :match
   bool has_decor = false;               // this buffer has decoration
   bool do_virttext = false;             // draw virtual text for this line
+  int win_col_offset = 0;               // offset for window columns
 
   char_u buf_fold[FOLD_TEXT_LEN + 1];   // Hold value returned by get_foldtext
 
@@ -2649,7 +2653,7 @@ static int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow,
     off += col;
   }
 
-  // wont highlight after TERM_ATTRS_MAX columns
+  // won't highlight after TERM_ATTRS_MAX columns
   int term_attrs[TERM_ATTRS_MAX] = { 0 };
   if (wp->w_buffer->terminal) {
     terminal_get_line_attributes(wp->w_buffer->terminal, wp, lnum, term_attrs);
@@ -2756,8 +2760,9 @@ static int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow,
               }
               if (wp->w_p_rl) {                       // reverse line numbers
                 // like rl_mirror(), but keep the space at the end
-                char_u *p2 = skiptowhite(extra) - 1;
-                for (char_u *p1 = extra; p1 < p2; p1++, p2--) {
+                char_u *p2 = skipwhite(extra);
+                p2 = skiptowhite(p2) - 1;
+                for (char_u *p1 = skipwhite(extra); p1 < p2; p1++, p2--) {
                   const int t = *p1;
                   *p1 = *p2;
                   *p2 = t;
@@ -2788,6 +2793,10 @@ static int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow,
             }
           }
         }
+      }
+
+      if (draw_state == WL_NR && n_extra == 0) {
+        win_col_offset = off;
       }
 
       if (wp->w_briopt_sbr && draw_state == WL_BRI - 1
@@ -2904,7 +2913,7 @@ static int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow,
           && vcol >= (long)wp->w_virtcol)
          || (number_only && draw_state > WL_NR))
         && filler_todo <= 0) {
-      draw_virt_text(buf, &col, grid->Columns);
+      draw_virt_text(buf, win_col_offset, &col, grid->Columns);
       grid_put_linebuf(grid, row, 0, col, -grid->Columns, wp->w_p_rl, wp,
                        wp->w_hl_attr_normal, false);
       // Pretend we have finished updating the window.  Except when
@@ -3945,13 +3954,15 @@ static int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow,
         draw_color_col = advance_color_col(VCOL_HLC, &color_cols);
 
       VirtText virt_text = KV_INITIAL_VALUE;
+      bool has_aligned = false;
       if (err_text) {
         int hl_err = syn_check_group((char_u *)S_LEN("ErrorMsg"));
         kv_push(virt_text, ((VirtTextChunk){ .text = err_text,
                                              .hl_id = hl_err }));
         do_virttext = true;
       } else if (has_decor) {
-        virt_text = decor_redraw_virt_text(wp->w_buffer, &decor_state);
+        virt_text = decor_redraw_eol(wp->w_buffer, &decor_state, &line_attr,
+                                     &has_aligned);
         if (kv_size(virt_text)) {
           do_virttext = true;
         }
@@ -3963,7 +3974,8 @@ static int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow,
             grid->Columns * (row - startrow + 1) + v
             && lnum != wp->w_cursor.lnum)
            || draw_color_col || line_attr_lowprio || line_attr
-           || diff_hlf != (hlf_T)0 || do_virttext)) {
+           || diff_hlf != (hlf_T)0 || do_virttext
+           || has_aligned)) {
         int rightmost_vcol = 0;
         int i;
 
@@ -4001,7 +4013,7 @@ static int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow,
         }
 
         int base_attr = hl_combine_attr(line_attr_lowprio, diff_attr);
-        if (base_attr || line_attr) {
+        if (base_attr || line_attr || has_aligned) {
           rightmost_vcol = INT_MAX;
         }
 
@@ -4079,7 +4091,7 @@ static int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow,
         }
       }
 
-      draw_virt_text(buf, &col, grid->Columns);
+      draw_virt_text(buf, win_col_offset, &col, grid->Columns);
       grid_put_linebuf(grid, row, 0, col, grid->Columns, wp->w_p_rl, wp,
                        wp->w_hl_attr_normal, false);
       row++;
@@ -4130,9 +4142,16 @@ static int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow,
     // highlight the cursor position itself.
     // Also highlight the 'colorcolumn' if it is different than
     // 'cursorcolumn'
+    // Also highlight the 'colorcolumn' if 'breakindent' and/or 'showbreak'
+    // options are set
     vcol_save_attr = -1;
-    if (draw_state == WL_LINE && !lnum_in_visual_area
-        && search_attr == 0 && area_attr == 0) {
+    if ((draw_state == WL_LINE
+         || draw_state == WL_BRI
+         || draw_state == WL_SBR)
+        && !lnum_in_visual_area
+        && search_attr == 0
+        && area_attr == 0
+        && filler_todo <= 0) {
       if (wp->w_p_cuc && VCOL_HLC == (long)wp->w_virtcol
           && lnum != wp->w_cursor.lnum) {
         vcol_save_attr = char_attr;
@@ -4300,7 +4319,7 @@ static int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow,
         && !wp->w_p_rl;              // Not right-to-left.
 
       int draw_col = col - boguscols;
-      draw_virt_text(buf, &draw_col, grid->Columns);
+      draw_virt_text(buf, win_col_offset, &draw_col, grid->Columns);
       grid_put_linebuf(grid, row, 0, draw_col, grid->Columns, wp->w_p_rl,
                        wp, wp->w_hl_attr_normal, wrap);
       if (wrap) {
@@ -4377,51 +4396,62 @@ static int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow,
   return row;
 }
 
-void draw_virt_text(buf_T *buf, int *end_col, int max_col)
+void draw_virt_text(buf_T *buf, int col_off, int *end_col, int max_col)
 {
   DecorState *state = &decor_state;
+  int right_pos = max_col;
   for (size_t i = 0; i < kv_size(state->active); i++) {
-    HlRange *item = &kv_A(state->active, i);
-    if (item->start_row == state->row && kv_size(item->virt_text)
-        && item->virt_text_pos == kVTOverlay
-        && item->virt_col >= 0) {
-        VirtText vt = item->virt_text;
-        LineState s = LINE_STATE("");
-        int virt_attr = 0;
-        int col = item->virt_col;
-        size_t virt_pos = 0;
-        item->virt_col = -2;  // deactivate
-
-        while (col < max_col) {
-          if (!*s.p) {
-            if (virt_pos == kv_size(vt)) {
-              break;
-            }
-            s.p = kv_A(vt, virt_pos).text;
-            int hl_id = kv_A(vt, virt_pos).hl_id;
-            virt_attr = hl_id > 0 ? syn_id2attr(hl_id) : 0;
-            virt_pos++;
-            continue;
-          }
-          int attr;
-          bool through = false;
-          if (item->hl_mode == kHlModeCombine) {
-            attr = hl_combine_attr(linebuf_attr[col], virt_attr);
-          } else if (item->hl_mode == kHlModeBlend) {
-            through = (*s.p == ' ');
-            attr = hl_blend_attrs(linebuf_attr[col], virt_attr, &through);
-          } else {
-            attr = virt_attr;
-          }
-          schar_T dummy[2];
-          int cells = line_putchar(&s, through ? dummy : &linebuf_char[col],
-                                   max_col-col, false);
-          linebuf_attr[col++] = attr;
-          if (cells > 1) {
-            linebuf_attr[col++] = attr;
-          }
+    DecorRange *item = &kv_A(state->active, i);
+    if (item->start_row == state->row && kv_size(item->decor.virt_text)) {
+      if (item->win_col == -1) {
+        if (item->decor.virt_text_pos == kVTRightAlign) {
+          right_pos -= item->decor.col;
+          item->win_col = right_pos;
+        } else if (item->decor.virt_text_pos == kVTWinCol) {
+          item->win_col = MAX(item->decor.col+col_off, 0);
         }
-        *end_col = MAX(*end_col, col);
+      }
+      if (item->win_col < 0) {
+        continue;
+      }
+      VirtText vt = item->decor.virt_text;
+      HlMode hl_mode = item->decor.hl_mode;
+      LineState s = LINE_STATE("");
+      int virt_attr = 0;
+      int col = item->win_col;
+      size_t virt_pos = 0;
+      item->win_col = -2;  // deactivate
+
+      while (col < max_col) {
+        if (!*s.p) {
+          if (virt_pos == kv_size(vt)) {
+            break;
+          }
+          s.p = kv_A(vt, virt_pos).text;
+          int hl_id = kv_A(vt, virt_pos).hl_id;
+          virt_attr = hl_id > 0 ? syn_id2attr(hl_id) : 0;
+          virt_pos++;
+          continue;
+        }
+        int attr;
+        bool through = false;
+        if (hl_mode == kHlModeCombine) {
+          attr = hl_combine_attr(linebuf_attr[col], virt_attr);
+        } else if (hl_mode == kHlModeBlend) {
+          through = (*s.p == ' ');
+          attr = hl_blend_attrs(linebuf_attr[col], virt_attr, &through);
+        } else {
+          attr = virt_attr;
+        }
+        schar_T dummy[2];
+        int cells = line_putchar(&s, through ? dummy : &linebuf_char[col],
+                                 max_col-col, false);
+        linebuf_attr[col++] = attr;
+        if (cells > 1) {
+          linebuf_attr[col++] = attr;
+        }
+      }
+      *end_col = MAX(*end_col, col);
     }
   }
 }
@@ -5500,7 +5530,7 @@ static void win_redr_border(win_T *wp)
   }
 }
 
-// Low-level functions to manipulate invidual character cells on the
+// Low-level functions to manipulate individual character cells on the
 // screen grid.
 
 /// Put a ASCII character in a screen cell.
@@ -6226,7 +6256,7 @@ void check_for_delay(int check_msg_scroll)
       && !did_wait_return
       && emsg_silent == 0) {
     ui_flush();
-    os_delay(1000L, true);
+    os_delay(1006L, true);
     emsg_on_display = false;
     if (check_msg_scroll) {
       msg_scroll = false;
@@ -6807,7 +6837,7 @@ int showmode(void)
     msg_pos_mode();
     attr = HL_ATTR(HLF_CM);                     // Highlight mode
 
-    // When the screen is too narrow to show the entire mode messsage,
+    // When the screen is too narrow to show the entire mode message,
     // avoid scrolling and truncate instead.
     msg_no_more = true;
     int save_lines_left = lines_left;
@@ -6923,7 +6953,7 @@ int showmode(void)
     msg_clr_cmdline();
   }
 
-  // NB: also handles clearing the showmode if it was emtpy or disabled
+  // NB: also handles clearing the showmode if it was empty or disabled
   msg_ext_flush_showmode();
 
   /* In Visual mode the size of the selected area must be redrawn. */
@@ -7184,7 +7214,24 @@ void ui_ext_tabline_update(void)
 
     ADD(tabs, DICTIONARY_OBJ(tab_info));
   }
-  ui_call_tabline_update(curtab->handle, tabs);
+
+  Array buffers = ARRAY_DICT_INIT;
+  FOR_ALL_BUFFERS(buf) {
+    // Do not include unlisted buffers
+    if (!buf->b_p_bl) {
+      continue;
+    }
+
+    Dictionary buffer_info = ARRAY_DICT_INIT;
+    PUT(buffer_info, "buffer", BUFFER_OBJ(buf->handle));
+
+    get_trans_bufname(buf);
+    PUT(buffer_info, "name", STRING_OBJ(cstr_to_string((char *)NameBuff)));
+
+    ADD(buffers, DICTIONARY_OBJ(buffer_info));
+  }
+
+  ui_call_tabline_update(curtab->handle, tabs, curbuf->handle, buffers);
 }
 
 /*

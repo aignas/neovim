@@ -525,6 +525,8 @@ struct file_buffer {
   int b_flags;                  // various BF_ flags
   int b_locked;                 // Buffer is being closed or referenced, don't
                                 // let autocommands wipe it out.
+  int b_ro_locked;              // Non-zero when the buffer can't be changed.
+                                // Used for FileChangedRO
 
   //
   // b_ffname   has the full path of the file (NULL for no name).
@@ -849,8 +851,8 @@ struct file_buffer {
                                 // may use a different synblock_T.
 
   sign_entry_T *b_signlist;     // list of placed signs
-  int b_signcols_max;           // cached maximum number of sign columns
   int b_signcols;               // last calculated number of sign columns
+  bool b_signcols_valid;        // calculated sign columns is valid
 
   Terminal *terminal;           // Terminal instance associated with the buffer
 
@@ -1083,12 +1085,14 @@ typedef struct {
   FloatRelative relative;
   bool external;
   bool focusable;
+  int zindex;
   WinStyle style;
   bool border;
   bool shadow;
   schar_T border_chars[8];
   int border_hl_ids[8];
   int border_attr[8];
+  bool noautocmd;
 } FloatConfig;
 
 #define FLOAT_CONFIG_INIT ((FloatConfig){ .height = 0, .width = 0, \
@@ -1096,7 +1100,9 @@ typedef struct {
                                           .row = 0, .col = 0, .anchor = 0, \
                                           .relative = 0, .external = false, \
                                           .focusable = true, \
-                                          .style = kWinStyleUnused })
+                                          .zindex = kZIndexFloatDefault, \
+                                          .style = kWinStyleUnused, \
+                                          .noautocmd = false })
 
 // Structure to store last cursor position and topline.  Used by check_lnums()
 // and reset_lnums().

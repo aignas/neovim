@@ -144,10 +144,6 @@ static int get_function_args(char_u **argp, char_u endchar, garray_T *newargs,
           c = *p;
           *p = NUL;
           expr = vim_strsave(expr);
-          if (expr == NULL) {
-            *p = c;
-            goto err_ret;
-          }
           ((char_u **)(default_args->ga_data))
             [default_args->ga_len] = expr;
           default_args->ga_len++;
@@ -537,7 +533,7 @@ static char_u *fname_trans_sid(const char_u *const name,
       if (current_sctx.sc_sid <= 0) {
         *error = ERROR_SCRIPT;
       } else {
-        snprintf((char *)fname_buf + 3, FLEN_FIXED + 1, "%" PRId64 "_",
+        snprintf((char *)fname_buf + i, FLEN_FIXED + 1 - i, "%" PRId64 "_",
                  (int64_t)current_sctx.sc_sid);
         i = (int)STRLEN(fname_buf);
       }
@@ -833,6 +829,8 @@ void call_user_func(ufunc_T *fp, int argcount, typval_T *argvars,
   bool islambda = false;
   char_u numbuf[NUMBUFLEN];
   char_u      *name;
+  typval_T *tv_to_free[MAX_FUNC_ARGS];
+  int tv_to_free_len = 0;
   proftime_T wait_start;
   proftime_T call_start;
   int started_profiling = false;
@@ -984,6 +982,11 @@ void call_user_func(ufunc_T *fp, int argcount, typval_T *argvars,
     // "argvars" must have VAR_FIXED for v_lock.
     v->di_tv = isdefault ? def_rettv : argvars[i];
     v->di_tv.v_lock = VAR_FIXED;
+
+    if (isdefault) {
+      // Need to free this later, no matter where it's stored.
+      tv_to_free[tv_to_free_len++] = &v->di_tv;
+    }
 
     if (addlocal) {
       // Named arguments can be accessed without the "a:" prefix in lambda
@@ -1209,7 +1212,9 @@ void call_user_func(ufunc_T *fp, int argcount, typval_T *argvars,
 
   did_emsg |= save_did_emsg;
   depth--;
-
+  for (int i = 0; i < tv_to_free_len; i++) {
+    tv_clear(tv_to_free[i]);
+  }
   cleanup_function_call(fc);
 
   if (--fp->uf_calls <= 0 && fp->uf_refcount <= 0) {
@@ -2450,13 +2455,13 @@ void ex_function(exarg_T *eap)
       goto erret;
     }
     if (fudi.fd_di == NULL) {
-      if (tv_check_lock(fudi.fd_dict->dv_lock, (const char *)eap->arg,
-                        TV_CSTRING)) {
+      if (var_check_lock(fudi.fd_dict->dv_lock, (const char *)eap->arg,
+                         TV_CSTRING)) {
         // Can't add a function to a locked dictionary
         goto erret;
       }
-    } else if (tv_check_lock(fudi.fd_di->di_tv.v_lock, (const char *)eap->arg,
-                             TV_CSTRING)) {
+    } else if (var_check_lock(fudi.fd_di->di_tv.v_lock, (const char *)eap->arg,
+                              TV_CSTRING)) {
       // Can't change an existing function if it is locked
       goto erret;
     }
@@ -3024,13 +3029,13 @@ int do_return(exarg_T *eap, int reanimate, int is_cmd, void *rettv)
     current_funccal->returned = false;
   }
 
-  /*
-   * Cleanup (and inactivate) conditionals, but stop when a try conditional
-   * not in its finally clause (which then is to be executed next) is found.
-   * In this case, make the ":return" pending for execution at the ":endtry".
-   * Otherwise, return normally.
-   */
-  idx = cleanup_conditionals(eap->cstack, 0, TRUE);
+  //
+  // Cleanup (and deactivate) conditionals, but stop when a try conditional
+  // not in its finally clause (which then is to be executed next) is found.
+  // In this case, make the ":return" pending for execution at the ":endtry".
+  // Otherwise, return normally.
+  //
+  idx = cleanup_conditionals(eap->cstack, 0, true);
   if (idx >= 0) {
     cstack->cs_pending[idx] = CSTP_RETURN;
 
@@ -3454,54 +3459,54 @@ dictitem_T *find_var_in_scoped_ht(const char *name, const size_t namelen,
 /// Set "copyID + 1" in previous_funccal and callers.
 bool set_ref_in_previous_funccal(int copyID)
 {
-  bool abort = false;
-
-  for (funccall_T *fc = previous_funccal; !abort && fc != NULL;
+  for (funccall_T *fc = previous_funccal; fc != NULL;
        fc = fc->caller) {
     fc->fc_copyID = copyID + 1;
-    abort = abort
-      || set_ref_in_ht(&fc->l_vars.dv_hashtab, copyID + 1, NULL)
-      || set_ref_in_ht(&fc->l_avars.dv_hashtab, copyID + 1, NULL)
-      || set_ref_in_list(&fc->l_varlist, copyID + 1, NULL);
+    if (set_ref_in_ht(&fc->l_vars.dv_hashtab, copyID + 1, NULL)
+        || set_ref_in_ht(&fc->l_avars.dv_hashtab, copyID + 1, NULL)
+        || set_ref_in_list(&fc->l_varlist, copyID + 1, NULL)) {
+      return true;
+    }
   }
-  return abort;
+  return false;
 }
 
 static bool set_ref_in_funccal(funccall_T *fc, int copyID)
 {
-  bool abort = false;
-
   if (fc->fc_copyID != copyID) {
     fc->fc_copyID = copyID;
-    abort = abort
-      || set_ref_in_ht(&fc->l_vars.dv_hashtab, copyID, NULL)
-      || set_ref_in_ht(&fc->l_avars.dv_hashtab, copyID, NULL)
-      || set_ref_in_list(&fc->l_varlist, copyID, NULL)
-      || set_ref_in_func(NULL, fc->func, copyID);
+    if (set_ref_in_ht(&fc->l_vars.dv_hashtab, copyID, NULL)
+        || set_ref_in_ht(&fc->l_avars.dv_hashtab, copyID, NULL)
+        || set_ref_in_list(&fc->l_varlist, copyID, NULL)
+        || set_ref_in_func(NULL, fc->func, copyID)) {
+      return true;
+    }
   }
-  return abort;
+  return false;
 }
 
 /// Set "copyID" in all local vars and arguments in the call stack.
 bool set_ref_in_call_stack(int copyID)
 {
-  bool abort = false;
-
-  for (funccall_T *fc = current_funccal; !abort && fc != NULL;
+  for (funccall_T *fc = current_funccal; fc != NULL;
        fc = fc->caller) {
-    abort = abort || set_ref_in_funccal(fc, copyID);
-  }
-
-  // Also go through the funccal_stack.
-  for (funccal_entry_T *entry = funccal_stack; !abort && entry != NULL;
-       entry = entry->next) {
-    for (funccall_T *fc = entry->top_funccal; !abort && fc != NULL;
-         fc = fc->caller) {
-      abort = abort || set_ref_in_funccal(fc, copyID);
+    if (set_ref_in_funccal(fc, copyID)) {
+      return true;
     }
   }
 
-  return abort;
+  // Also go through the funccal_stack.
+  for (funccal_entry_T *entry = funccal_stack; entry != NULL;
+       entry = entry->next) {
+    for (funccall_T *fc = entry->top_funccal; fc != NULL;
+         fc = fc->caller) {
+      if (set_ref_in_funccal(fc, copyID)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 /// Set "copyID" in all functions available by name.
@@ -3509,7 +3514,6 @@ bool set_ref_in_functions(int copyID)
 {
   int todo;
   hashitem_T *hi = NULL;
-  bool abort = false;
   ufunc_T *fp;
 
   todo = (int)func_hashtab.ht_used;
@@ -3517,24 +3521,25 @@ bool set_ref_in_functions(int copyID)
     if (!HASHITEM_EMPTY(hi)) {
       todo--;
       fp = HI2UF(hi);
-      if (!func_name_refcount(fp->uf_name)) {
-        abort = abort || set_ref_in_func(NULL, fp, copyID);
+      if (!func_name_refcount(fp->uf_name)
+          && set_ref_in_func(NULL, fp, copyID)) {
+        return true;
       }
     }
   }
-  return abort;
+  return false;
 }
 
 /// Set "copyID" in all function arguments.
 bool set_ref_in_func_args(int copyID)
 {
-  bool abort = false;
-
   for (int i = 0; i < funcargs.ga_len; i++) {
-    abort = abort || set_ref_in_item(((typval_T **)funcargs.ga_data)[i],
-                                     copyID, NULL, NULL);
+    if (set_ref_in_item(((typval_T **)funcargs.ga_data)[i],
+                        copyID, NULL, NULL)) {
+       return true;
+    }
   }
-  return abort;
+  return false;
 }
 
 /// Mark all lists and dicts referenced through function "name" with "copyID".

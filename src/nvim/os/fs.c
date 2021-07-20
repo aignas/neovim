@@ -471,8 +471,6 @@ FILE *os_fopen(const char *path, const char *flags)
         abort();
     }
   }
-  // Per open(2) manpage.
-  assert((iflags|O_RDONLY) || (iflags|O_WRONLY) || (iflags|O_RDWR));
   // Per fopen(3) manpage: default to 0666, it will be umask-adjusted.
   int fd = os_open(path, iflags, 0666);
   if (fd < 0) {
@@ -1121,7 +1119,7 @@ uint64_t os_fileinfo_blocksize(const FileInfo *file_info)
 ///
 /// @param path Path to the file.
 /// @param[out] file_info Pointer to a `FileID` to fill in.
-/// @return `true` on sucess, `false` for failure.
+/// @return `true` on success, `false` for failure.
 bool os_fileid(const char *path, FileID *file_id)
   FUNC_ATTR_NONNULL_ALL
 {

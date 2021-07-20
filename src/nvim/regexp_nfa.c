@@ -328,6 +328,11 @@ static int *post_start;   ///< holds the postfix form of r.e.
 static int *post_end;
 static int *post_ptr;
 
+// Set when the pattern should use the NFA engine.
+// E.g. [[:upper:]] only allows 8bit characters for BT engine,
+// while NFA engine handles multibyte characters correctly.
+static bool wants_nfa;
+
 static int nstate;  ///< Number of states in the NFA. Also used when executing.
 static int istate;  ///< Index in the state vector, used in alloc_state()
 
@@ -377,6 +382,7 @@ nfa_regcomp_start (
   post_start = (int *)xmalloc(postfix_size);
   post_ptr = post_start;
   post_end = post_start + nstate_max;
+  wants_nfa = false;
   rex.nfa_has_zend = false;
   rex.nfa_has_backref = false;
 
@@ -1155,8 +1161,6 @@ static int nfa_regatom(void)
   int emit_range;
   int negated;
   int startc = -1;
-  int endc = -1;
-  int oldstartc = -1;
   int save_prev_at_start = prev_at_start;
 
   c = getchr();
@@ -1455,10 +1459,10 @@ static int nfa_regatom(void)
         if (nfa_regatom() == FAIL)
           return FAIL;
       }
-      getchr();                    /* get the ] */
-      if (n == 0)
-        EMSG2_RET_FAIL(_(e_empty_sb),
-            reg_magic == MAGIC_ALL);
+      (void)getchr();  // get the ]
+      if (n == 0) {
+        EMSG2_RET_FAIL(_(e_empty_sb), reg_magic == MAGIC_ALL);
+      }
       EMIT(NFA_OPT_CHARS);
       EMIT(n);
 
@@ -1566,7 +1570,7 @@ collection:
        * Failed to recognize a character class. Use the simple
        * version that turns [abc] into 'a' OR 'b' OR 'c'
        */
-      startc = endc = oldstartc = -1;
+      startc = -1;
       negated = false;
       if (*regparse == '^') {                           // negated range
         negated = true;
@@ -1583,7 +1587,7 @@ collection:
       // Emit the OR branches for each character in the []
       emit_range = false;
       while (regparse < endp) {
-        oldstartc = startc;
+        int oldstartc = startc;
         startc = -1;
         got_coll_char = false;
         if (*regparse == '[') {
@@ -1618,6 +1622,7 @@ collection:
               EMIT(NFA_CLASS_GRAPH);
               break;
             case CLASS_LOWER:
+              wants_nfa = true;
               EMIT(NFA_CLASS_LOWER);
               break;
             case CLASS_PRINT:
@@ -1630,6 +1635,7 @@ collection:
               EMIT(NFA_CLASS_SPACE);
               break;
             case CLASS_UPPER:
+              wants_nfa = true;
               EMIT(NFA_CLASS_UPPER);
               break;
             case CLASS_XDIGIT:
@@ -1721,7 +1727,7 @@ collection:
 
         /* Previous char was '-', so this char is end of range. */
         if (emit_range) {
-          endc = startc;
+          int endc = startc;
           startc = oldstartc;
           if (startc > endc) {
             EMSG_RET_FAIL(_(e_reverse_range));
@@ -1998,10 +2004,17 @@ static int nfa_regpiece(void)
       return OK;
     }
 
-    // The engine is very inefficient (uses too many states) when the maximum
-    // is much larger than the minimum and when the maximum is large. Bail out
-    // if we can use the other engine.
-    if ((nfa_re_flags & RE_AUTO) && (maxval > 500 || maxval > minval + 200)) {
+    // The engine is very inefficient (uses too many states) when the
+    // maximum is much larger than the minimum and when the maximum is
+    // large.  However, when maxval is MAX_LIMIT, it is okay, as this
+    // will emit NFA_STAR.
+    // Bail out if we can use the other engine, but only, when the
+    // pattern does not need the NFA engine like (e.g. [[:upper:]]\{2,\}
+    // does not work with with characters > 8 bit with the BT engine)
+    if ((nfa_re_flags & RE_AUTO)
+        && (maxval > 500 || maxval > minval + 200)
+        && (maxval != MAX_LIMIT && minval < 200)
+        && !wants_nfa) {
       return FAIL;
     }
 
@@ -6055,21 +6068,27 @@ static int nfa_regmatch(nfa_regprog_T *prog, nfa_state_T *start,
       {
         pos_T *pos = getmark_buf(rex.reg_buf, t->state->val, false);
 
-        // Compare the mark position to the match position.
-        result = (pos != NULL                        // mark doesn't exist
-                  && pos->lnum > 0          // mark isn't set in reg_buf
-                  && (pos->lnum == rex.lnum + rex.reg_firstlnum
-                      ? (pos->col == (colnr_T)(rex.input - rex.line)
-                         ? t->state->c == NFA_MARK
-                         : (pos->col < (colnr_T)(rex.input - rex.line)
-                            ? t->state->c == NFA_MARK_GT
-                            : t->state->c == NFA_MARK_LT))
-                      : (pos->lnum < rex.lnum + rex.reg_firstlnum
-                         ? t->state->c == NFA_MARK_GT
-                         : t->state->c == NFA_MARK_LT)));
-        if (result) {
-          add_here = true;
-          add_state = t->state->out;
+        // Compare the mark position to the match position, if the mark
+        // exists and mark is set in reg_buf.
+        if (pos != NULL && pos->lnum > 0) {
+          const colnr_T pos_col = pos->lnum == rex.lnum + rex.reg_firstlnum
+            && pos->col == MAXCOL
+            ? (colnr_T)STRLEN(reg_getline(pos->lnum - rex.reg_firstlnum))
+            : pos->col;
+
+          result = pos->lnum == rex.lnum + rex.reg_firstlnum
+            ? (pos_col == (colnr_T)(rex.input - rex.line)
+               ? t->state->c == NFA_MARK
+               : (pos_col < (colnr_T)(rex.input - rex.line)
+                  ? t->state->c == NFA_MARK_GT
+                  : t->state->c == NFA_MARK_LT))
+            : (pos->lnum < rex.lnum + rex.reg_firstlnum
+               ? t->state->c == NFA_MARK_GT
+               : t->state->c == NFA_MARK_LT);
+          if (result) {
+            add_here = true;
+            add_state = t->state->out;
+          }
         }
         break;
       }
@@ -6491,7 +6510,7 @@ static long nfa_regtry(nfa_regprog_T *prog,
 }
 
 /// Match a regexp against a string ("line" points to the string) or multiple
-/// lines ("line" is NULL, use reg_getline()).
+/// lines (if "line" is NULL, use reg_getline()).
 ///
 /// @param line String in which to search or NULL
 /// @param startcol Column to start looking for match

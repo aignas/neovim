@@ -13,6 +13,7 @@
 #include "nvim/api/private/helpers.h"
 #include "nvim/vim.h"
 #include "nvim/ascii.h"
+#include "nvim/buffer.h"
 #include "nvim/iconv.h"
 #include "nvim/version.h"
 #include "nvim/charset.h"
@@ -406,13 +407,13 @@ static const int included_patches[] = {
   1514,
   1513,
   1512,
-  // 1511,
+  1511,
   1510,
   1509,
   1508,
   1507,
   1506,
-  // 1505,
+  1505,
   1504,
   1503,
   1502,
@@ -2190,7 +2191,7 @@ void list_version(void)
 /// Show the intro message when not editing a file.
 void maybe_intro_message(void)
 {
-  if (BUFEMPTY()
+  if (buf_is_empty(curbuf)
       && (curbuf->b_fname == NULL)
       && (firstwin->w_next == NULL)
       && (vim_strchr(p_shm, SHM_INTRO) == NULL)) {

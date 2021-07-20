@@ -982,12 +982,14 @@ static int check_external_diff(diffio_T *diffio)
           char_u linebuf[LBUFLEN];
 
           for (;;) {
-            // There must be a line that contains "1c1".
+            // For normal diff there must be a line that contains
+            // "1c1".  For unified diff "@@ -1 +1 @@".
             if (vim_fgets(linebuf, LBUFLEN, fd)) {
               break;
             }
 
-            if (STRNCMP(linebuf, "1c1", 3) == 0) {
+            if (STRNCMP(linebuf, "1c1", 3) == 0
+                || STRNCMP(linebuf, "@@ -1 +1 @@", 11) == 0) {
               ok = kTrue;
             }
           }
@@ -1332,9 +1334,9 @@ static void set_diff_option(win_T *wp, int value)
 
     curwin = wp;
     curbuf = curwin->w_buffer;
-    curbuf_lock++;
+    curbuf->b_ro_locked++;
     set_option_value("diff", (long)value, NULL, OPT_LOCAL);
-    curbuf_lock--;
+    curbuf->b_ro_locked--;
     curwin = old_curwin;
     curbuf = curwin->w_buffer;
 }
@@ -1867,7 +1869,7 @@ int diff_check(win_T *wp, linenr_T lnum)
 /// @param  idx1  first entry in diff "dp"
 /// @param  idx2  second entry in diff "dp"
 ///
-/// @return true if two entires are equal.
+/// @return true if two entries are equal.
 static bool diff_equal_entry(diff_T *dp, int idx1, int idx2)
   FUNC_ATTR_PURE FUNC_ATTR_WARN_UNUSED_RESULT FUNC_ATTR_NONNULL_ARG(1)
 {
@@ -2601,7 +2603,7 @@ void ex_diffgetput(exarg_T *eap)
   // FileChangedRO autocommand, which may do nasty things and mess
   // everything up.
   if (!curbuf->b_changed) {
-    change_warning(0);
+    change_warning(curbuf, 0);
     if (diff_buf_idx(curbuf) != idx_to) {
       EMSG(_("E787: Buffer changed unexpectedly"));
       goto theend;
@@ -2667,7 +2669,7 @@ void ex_diffgetput(exarg_T *eap)
         }
       }
 
-      buf_empty = BUFEMPTY();
+      buf_empty = buf_is_empty(curbuf);
       added = 0;
 
       for (i = 0; i < count; ++i) {

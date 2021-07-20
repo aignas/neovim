@@ -19,7 +19,7 @@
 // Marks live in namespaces that allow plugins/users to segregate marks
 // from other users.
 //
-// Deleting marks only happens when explicitly calling extmark_del, deleteing
+// Deleting marks only happens when explicitly calling extmark_del, deleting
 // over a range of marks will only move the marks. Deleting on a mark will
 // leave it in same position unless it is on the EOL of a line.
 //
@@ -702,6 +702,7 @@ void extmark_move_region(
     int new_row, colnr_T new_col, bcount_t new_byte,
     ExtmarkOp undo)
 {
+  curbuf->deleted_bytes2 = 0;
   // TODO(bfredl): this is not synced to the buffer state inside the callback.
   // But unless we make the undo implementation smarter, this is not ensured
   // anyway.

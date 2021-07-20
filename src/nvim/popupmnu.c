@@ -9,6 +9,7 @@
 #include <inttypes.h>
 #include <stdbool.h>
 
+#include "nvim/buffer.h"
 #include "nvim/vim.h"
 #include "nvim/api/private/helpers.h"
 #include "nvim/ascii.h"
@@ -421,6 +422,10 @@ void pum_redraw(void)
   }
 
   grid_assign_handle(&pum_grid);
+
+  pum_grid.zindex = ((State == CMDLINE)
+                     ? kZIndexCmdlinePopupMenu : kZIndexPopupMenu);
+
   bool moved = ui_comp_put_grid(&pum_grid, pum_row, pum_col-col_off,
                                 pum_height, grid_width, false, true);
   bool invalid_grid = moved || pum_invalid;
@@ -436,10 +441,10 @@ void pum_redraw(void)
   }
   if (ui_has(kUIMultigrid)) {
     const char *anchor = pum_above ? "SW" : "NW";
-    int row_off = pum_above ? pum_height : 0;
+    int row_off = pum_above ? -pum_height : 0;
     ui_call_win_float_pos(pum_grid.handle, -1, cstr_to_string(anchor),
                           pum_anchor_grid, pum_row-row_off, pum_col-col_off,
-                          false);
+                          false, pum_grid.zindex);
   }
 
 
@@ -731,7 +736,7 @@ static int pum_set_selected(int n, int repeat)
             && (curbuf->b_p_bt[2] == 'f')
             && (curbuf->b_p_bh[0] == 'w')) {
           // Already a "wipeout" buffer, make it empty.
-          while (!BUFEMPTY()) {
+          while (!buf_is_empty(curbuf)) {
             ml_delete((linenr_T)1, false);
           }
         } else {
