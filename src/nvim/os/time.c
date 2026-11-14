@@ -1,32 +1,24 @@
-// This is an open source non-commercial project. Dear PVS-Studio, please check
-// it. PVS-Studio Static Code Analyzer for C, C++ and C#: http://www.viva64.com
-
-#include <assert.h>
+#include <inttypes.h>
 #include <limits.h>
+#include <stdbool.h>
+#include <string.h>
+#include <time.h>
 
 #include <uv.h>
 
-#include "nvim/assert.h"
-#include "nvim/os/time.h"
-#include "nvim/os/input.h"
+#include "auto/config.h"
 #include "nvim/event/loop.h"
-#include "nvim/os/os.h"
+#include "nvim/event/multiqueue.h"
+#include "nvim/gettext_defs.h"
+#include "nvim/globals.h"
+#include "nvim/log.h"
 #include "nvim/main.h"
+#include "nvim/memory.h"
+#include "nvim/os/input.h"
+#include "nvim/os/os.h"
+#include "nvim/os/time.h"
 
-static uv_mutex_t delay_mutex;
-static uv_cond_t delay_cond;
-
-
-#ifdef INCLUDE_GENERATED_DECLARATIONS
-# include "os/time.c.generated.h"
-#endif
-
-/// Initializes the time module
-void time_init(void)
-{
-  uv_mutex_init(&delay_mutex);
-  uv_cond_init(&delay_cond);
-}
+#include "os/time.c.generated.h"
 
 /// Gets a high-resolution (nanosecond), monotonically-increasing time relative
 /// to an arbitrary time in the past.
@@ -38,6 +30,25 @@ uint64_t os_hrtime(void)
   FUNC_ATTR_WARN_UNUSED_RESULT
 {
   return uv_hrtime();
+}
+
+/// Obtain the current system time from a high-resolution
+/// real-time clock source.
+///
+/// The real-time clock counts from the UNIX epoch (1970-01-01)
+/// and is subject to time adjustments; it can jump back in time.
+///
+/// @return Nanoseconds since epoch or 0
+int64_t os_realtime(void)
+  FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  uv_timespec64_t ts = { 0 };
+  int error_number;
+  if ((error_number = uv_clock_gettime(UV_CLOCK_REALTIME, &ts)) != 0) {
+    ELOG("uv_clock_gettime failed: %d %s", error_number, uv_err_name(error_number));
+    return 0;
+  }
+  return ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
 }
 
 /// Gets a millisecond-resolution, monotonically-increasing time relative to an
@@ -62,55 +73,29 @@ uint64_t os_now(void)
 /// @param ignoreinput If true, only SIGINT (CTRL-C) can interrupt.
 void os_delay(uint64_t ms, bool ignoreinput)
 {
-  if (ignoreinput) {
-    if (ms > INT_MAX) {
-      ms = INT_MAX;
-    }
-    LOOP_PROCESS_EVENTS_UNTIL(&main_loop, NULL, (int)ms, got_int);
-  } else {
-    os_microdelay(ms * 1000u, ignoreinput);
+  DLOG("%" PRIu64 " ms", ms);
+  if (ms > INT_MAX) {
+    ms = INT_MAX;
   }
+  LOOP_PROCESS_EVENTS_UNTIL(&main_loop, NULL, (int)ms,
+                            ignoreinput ? got_int : os_input_ready(NULL));
 }
 
-/// Sleeps for `us` microseconds.
+/// Sleeps for `ms` milliseconds without checking for events or interrupts.
+///
+/// This blocks even "fast" events which is quite disruptive. This should only
+/// be used in debug code. Prefer os_delay() and decide if the delay should be
+/// interrupted by input or only a CTRL-C.
 ///
 /// @see uv_sleep() (libuv v1.34.0)
 ///
 /// @param us          Number of microseconds to sleep.
-/// @param ignoreinput If true, ignore all input (including SIGINT/CTRL-C).
-///                    If false, waiting is aborted on any input.
-void os_microdelay(uint64_t us, bool ignoreinput)
+void os_sleep(uint64_t ms)
 {
-  uint64_t elapsed = 0u;
-  uint64_t base = uv_hrtime();
-  // Convert microseconds to nanoseconds, or UINT64_MAX on overflow.
-  const uint64_t ns = (us < UINT64_MAX / 1000u) ? us * 1000u : UINT64_MAX;
-
-  uv_mutex_lock(&delay_mutex);
-
-  while (elapsed < ns) {
-    // If ignoring input, we simply wait the full delay.
-    // Else we check for input in ~100ms intervals.
-    const uint64_t ns_delta = ignoreinput
-                              ? ns - elapsed
-                              : MIN(ns - elapsed, 100000000u);  // 100ms
-
-    const int rv = uv_cond_timedwait(&delay_cond, &delay_mutex, ns_delta);
-    if (0 != rv && UV_ETIMEDOUT != rv) {
-      abort();
-      break;
-    }  // Else: Timeout proceeded normally.
-
-    if (!ignoreinput && os_char_avail()) {
-      break;
-    }
-
-    const uint64_t now = uv_hrtime();
-    elapsed += now - base;
-    base = now;
+  if (ms > UINT_MAX) {
+    ms = UINT_MAX;
   }
-
-  uv_mutex_unlock(&delay_mutex);
+  uv_sleep((unsigned)ms);
 }
 
 // Cache of the current timezone name as retrieved from TZ, or an empty string
@@ -130,8 +115,8 @@ struct tm *os_localtime_r(const time_t *restrict clock,
   // Call tzset(3) to update the global timezone variables if it has.
   // POSIX standard doesn't require localtime_r() implementations to do that
   // as it does with localtime(), and we don't want to call tzset() every time.
-  const char *tz = os_getenv("TZ");
-  if (tz == NULL) {
+  const char *tz = os_getenv_noalloc("TZ");
+  if (!tz) {
     tz = "";
   }
   if (strncmp(tz_cache, tz, sizeof(tz_cache) - 1) != 0) {
@@ -168,19 +153,28 @@ struct tm *os_localtime(struct tm *result) FUNC_ATTR_NONNULL_ALL
 /// @param result[out] Pointer to a 'char' where the result should be placed
 /// @param result_len length of result buffer
 /// @return human-readable string of current local time
-char *os_ctime_r(const time_t *restrict clock, char *restrict result,
-                 size_t result_len)
+char *os_ctime_r(const time_t *restrict clock, char *restrict result, size_t result_len,
+                 bool add_newline)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_NONNULL_RET
 {
   struct tm clock_local;
   struct tm *clock_local_ptr = os_localtime_r(clock, &clock_local);
   // MSVC returns NULL for an invalid value of seconds.
   if (clock_local_ptr == NULL) {
-    xstrlcpy(result, _("(Invalid)"), result_len);
+    xstrlcpy(result, _("(Invalid)"), result_len - 1);
   } else {
-    strftime(result, result_len, _("%a %b %d %H:%M:%S %Y"), clock_local_ptr);
+    // xgettext:no-c-format
+    if (strftime(result, result_len - 1, _("%a %b %d %H:%M:%S %Y"), clock_local_ptr) == 0) {
+      // Quoting "man strftime":
+      // > If the length of the result string (including the terminating
+      // > null byte) would exceed max bytes, then strftime() returns 0,
+      // > and the contents of the array are undefined.
+      xstrlcpy(result, _("(Invalid)"), result_len - 1);
+    }
   }
-  xstrlcat(result, "\n", result_len);
+  if (add_newline) {
+    xstrlcat(result, "\n", result_len);
+  }
   return result;
 }
 
@@ -189,11 +183,11 @@ char *os_ctime_r(const time_t *restrict clock, char *restrict result,
 /// @param result[out] Pointer to a 'char' where the result should be placed
 /// @param result_len length of result buffer
 /// @return human-readable string of current local time
-char *os_ctime(char *result, size_t result_len)
+char *os_ctime(char *result, size_t result_len, bool add_newline)
   FUNC_ATTR_NONNULL_ALL FUNC_ATTR_NONNULL_RET
 {
   time_t rawtime = time(NULL);
-  return os_ctime_r(&rawtime, result, result_len);
+  return os_ctime_r(&rawtime, result, result_len, add_newline);
 }
 
 /// Portable version of POSIX strptime()
@@ -218,5 +212,5 @@ char *os_strptime(const char *str, const char *format, struct tm *tm)
 Timestamp os_time(void)
   FUNC_ATTR_WARN_UNUSED_RESULT
 {
-  return (Timestamp) time(NULL);
+  return (Timestamp)time(NULL);
 }

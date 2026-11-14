@@ -1,10 +1,12 @@
 -- Tests for :sort command.
 
-local helpers = require('test.functional.helpers')(after_each)
+local t = require('test.testutil')
+local describe, it, before_each = t.describe, t.it, t.before_each
+local pcall_err = t.pcall_err
+local n = require('test.functional.testnvim')()
 
-local insert, command, clear, expect, eq, poke_eventloop = helpers.insert,
-  helpers.command, helpers.clear, helpers.expect, helpers.eq, helpers.poke_eventloop
-local exc_exec = helpers.exc_exec
+local insert, command, clear, expect, eq, poke_eventloop =
+  n.insert, n.command, n.clear, n.expect, t.eq, n.poke_eventloop
 
 describe(':sort', function()
   local text = [[
@@ -618,7 +620,7 @@ describe(':sort', function()
   it('fails with wrong arguments', function()
     insert(text)
     -- This should fail with "E474: Invalid argument".
-    eq('Vim(sort):E474: Invalid argument', exc_exec('sort no'))
+    eq('Vim(sort):E474: Invalid argument', pcall_err(command, 'sort no'))
     expect(text)
   end)
 

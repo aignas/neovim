@@ -1,12 +1,21 @@
+" Language:	Vim Tutor
+" Maintainer:	Vim Project
+" Last Change:	2025 Apr 16
+
 if exists("b:current_syntax")
     finish
 endif
+
+let s:cpo_save = &cpo
+set cpo&vim
 
 syn include @VIM syntax/vim.vim
 unlet b:current_syntax
 syn include @TUTORSHELL syntax/sh.vim
 unlet b:current_syntax
 syn include @VIMNORMAL syntax/vimnormal.vim
+
+syn iskeyword @,-,_,48-57
 
 syn match tutorLink /\[.\{-}\](.\{-})/ contains=tutorInlineNormal
 syn match tutorLinkBands /\[\|\]\|(\|)/ contained containedin=tutorLink,tutorLinkAnchor conceal
@@ -75,3 +84,5 @@ hi def link tutorInlineX tutorX
 hi def link tutorShellPrompt Delimiter
 
 let b:current_syntax = "tutor"
+let &cpo = s:cpo_save
+unlet s:cpo_save

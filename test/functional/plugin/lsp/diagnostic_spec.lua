@@ -1,878 +1,988 @@
-local helpers = require('test.functional.helpers')(after_each)
+local t = require('test.testutil')
+local n = require('test.functional.testnvim')()
 
-local clear = helpers.clear
-local exec_lua = helpers.exec_lua
-local eq = helpers.eq
-local nvim = helpers.nvim
+local t_lsp = require('test.functional.plugin.lsp.testutil')
+
+local describe, it, before_each, after_each = t.describe, t.it, t.before_each, t.after_each
+local clear = n.clear
+local exec_lua = n.exec_lua
+local eq = t.eq
+local neq = t.neq
+local matches = t.matches
+local pcall_err = t.pcall_err
+
+local create_server_definition = t_lsp.create_server_definition
 
 describe('vim.lsp.diagnostic', function()
-  local fake_uri
+  local fake_uri --- @type string
+  local client_id --- @type integer
+  local diagnostic_bufnr --- @type integer
 
   before_each(function()
-    clear()
+    clear { env = {
+      NVIM_LUA_NOTRACK = '1',
+      VIMRUNTIME = os.getenv 'VIMRUNTIME',
+    } }
 
-    exec_lua [[
+    exec_lua(function()
       require('vim.lsp')
 
-      make_range = function(x1, y1, x2, y2)
+      _G.make_range = function(x1, y1, x2, y2)
         return { start = { line = x1, character = y1 }, ['end'] = { line = x2, character = y2 } }
       end
 
-      make_error = function(msg, x1, y1, x2, y2)
+      _G.make_error = function(msg, x1, y1, x2, y2)
         return {
-          range = make_range(x1, y1, x2, y2),
+          range = _G.make_range(x1, y1, x2, y2),
           message = msg,
           severity = 1,
         }
       end
 
-      make_warning = function(msg, x1, y1, x2, y2)
+      _G.make_warning = function(msg, x1, y1, x2, y2)
         return {
-          range = make_range(x1, y1, x2, y2),
+          range = _G.make_range(x1, y1, x2, y2),
           message = msg,
           severity = 2,
         }
       end
 
-      make_information = function(msg, x1, y1, x2, y2)
+      _G.make_information = function(msg, x1, y1, x2, y2)
         return {
-          range = make_range(x1, y1, x2, y2),
+          range = _G.make_range(x1, y1, x2, y2),
           message = msg,
           severity = 3,
         }
       end
 
-      count_of_extmarks_for_client = function(bufnr, client_id)
-        return #vim.api.nvim_buf_get_extmarks(
-          bufnr, vim.lsp.diagnostic._get_diagnostic_namespace(client_id), 0, -1, {}
-        )
+      function _G.get_extmarks(bufnr, client_id0)
+        local namespace = vim.lsp.diagnostic.get_namespace(client_id0)
+        local ns = vim.diagnostic.get_namespace(namespace)
+        local extmarks = {}
+        if ns.user_data.virt_text_ns then
+          for _, e in
+            pairs(
+              vim.api.nvim_buf_get_extmarks(
+                bufnr,
+                ns.user_data.virt_text_ns,
+                0,
+                -1,
+                { details = true }
+              )
+            )
+          do
+            table.insert(extmarks, e)
+          end
+        end
+        if ns.user_data.underline_ns then
+          for _, e in
+            pairs(
+              vim.api.nvim_buf_get_extmarks(
+                bufnr,
+                ns.user_data.underline_ns,
+                0,
+                -1,
+                { details = true }
+              )
+            )
+          do
+            table.insert(extmarks, e)
+          end
+        end
+        return extmarks
       end
-    ]]
+    end)
 
-    fake_uri = "file://fake/uri"
+    fake_uri = 'file:///fake/uri'
 
-    exec_lua([[
-      fake_uri = ...
-      diagnostic_bufnr = vim.uri_to_bufnr(fake_uri)
-      local lines = {"1st line of text", "2nd line of text", "wow", "cool", "more", "lines"}
+    exec_lua(function()
+      diagnostic_bufnr = vim.uri.to_buf(fake_uri)
+      local lines = { '1st line', '2nd line of text', 'wow', 'cool', 'more', 'lines' }
       vim.fn.bufload(diagnostic_bufnr)
       vim.api.nvim_buf_set_lines(diagnostic_bufnr, 0, 1, false, lines)
-      return diagnostic_bufnr
-    ]], fake_uri)
-  end)
-
-  after_each(function()
-    clear()
-  end)
-
-  describe('vim.lsp.diagnostic', function()
-    describe('handle_publish_diagnostics', function()
-      it('should be able to retrieve diagnostics from all buffers and clients', function()
-        local result = exec_lua [[
-          vim.lsp.diagnostic.save(
-            {
-              make_error('Diagnostic #1', 1, 1, 1, 1),
-              make_error('Diagnostic #2', 2, 1, 2, 1),
-            }, 1, 1
-          )
-          vim.lsp.diagnostic.save(
-            {
-              make_error('Diagnostic #3', 3, 1, 3, 1),
-            }, 2, 2
-          )
-          return vim.lsp.diagnostic.get_all()
-        ]]
-        eq(2, #result)
-        eq(2, #result[1])
-        eq('Diagnostic #1', result[1][1].message)
-      end)
-      it('should be able to save and count a single client error', function()
-        eq(1, exec_lua [[
-          vim.lsp.diagnostic.save(
-            {
-              make_error('Diagnostic #1', 1, 1, 1, 1),
-            }, 0, 1
-          )
-          return vim.lsp.diagnostic.get_count(0, "Error", 1)
-        ]])
-      end)
-
-      it('should be able to save and count from two clients', function()
-        eq(2, exec_lua [[
-          vim.lsp.diagnostic.save(
-            {
-              make_error('Diagnostic #1', 1, 1, 1, 1),
-              make_error('Diagnostic #2', 2, 1, 2, 1),
-            }, 0, 1
-          )
-          return vim.lsp.diagnostic.get_count(0, "Error", 1)
-        ]])
-      end)
-
-      it('should be able to save and count from multiple clients', function()
-        eq({1, 1, 2}, exec_lua [[
-          vim.lsp.diagnostic.save(
-            {
-              make_error('Diagnostic From Server 1', 1, 1, 1, 1),
-            }, 0, 1
-          )
-          vim.lsp.diagnostic.save(
-            {
-              make_error('Diagnostic From Server 2', 1, 1, 1, 1),
-            }, 0, 2
-          )
-          return {
-            -- Server 1
-            vim.lsp.diagnostic.get_count(0, "Error", 1),
-            -- Server 2
-            vim.lsp.diagnostic.get_count(0, "Error", 2),
-            -- All servers
-            vim.lsp.diagnostic.get_count(0, "Error", nil),
-          }
-        ]])
-      end)
-
-      it('should be able to save and count from multiple clients with respect to severity', function()
-        eq({3, 0, 3}, exec_lua [[
-          vim.lsp.diagnostic.save(
-            {
-              make_error('Diagnostic From Server 1:1', 1, 1, 1, 1),
-              make_error('Diagnostic From Server 1:2', 2, 2, 2, 2),
-              make_error('Diagnostic From Server 1:3', 2, 3, 3, 2),
-            }, 0, 1
-          )
-          vim.lsp.diagnostic.save(
-            {
-              make_warning('Warning From Server 2', 3, 3, 3, 3),
-            }, 0, 2
-          )
-          return {
-            -- Server 1
-            vim.lsp.diagnostic.get_count(0, "Error", 1),
-            -- Server 2
-            vim.lsp.diagnostic.get_count(0, "Error", 2),
-            -- All servers
-            vim.lsp.diagnostic.get_count(0, "Error", nil),
-          }
-        ]])
-      end)
-      it('should handle one server clearing highlights while the other still has highlights', function()
-        -- 1 Error (1)
-        -- 1 Warning (2)
-        -- 1 Warning (2) + 1 Warning (1)
-        -- 2 highlights and 2 underlines (since error)
-        -- 1 highlight + 1 underline
-        local all_highlights = {1, 1, 2, 4, 2}
-        eq(all_highlights, exec_lua [[
-          local server_1_diags = {
-            make_error("Error 1", 1, 1, 1, 5),
-            make_warning("Warning on Server 1", 2, 1, 2, 5),
-          }
-          local server_2_diags = {
-            make_warning("Warning 1", 2, 1, 2, 5),
-          }
-
-          vim.lsp.diagnostic.on_publish_diagnostics(nil, nil, { uri = fake_uri, diagnostics = server_1_diags }, 1)
-          vim.lsp.diagnostic.on_publish_diagnostics(nil, nil, { uri = fake_uri, diagnostics = server_2_diags }, 2)
-          return {
-            vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1),
-            vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Warning", 2),
-            vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Warning", nil),
-            count_of_extmarks_for_client(diagnostic_bufnr, 1),
-            count_of_extmarks_for_client(diagnostic_bufnr, 2),
-          }
-        ]])
-
-        -- Clear diagnostics from server 1, and make sure we have the right amount of stuff for client 2
-        eq({1, 1, 2, 0, 2}, exec_lua [[
-          vim.lsp.diagnostic.clear(diagnostic_bufnr, 1)
-          return {
-            vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1),
-            vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Warning", 2),
-            vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Warning", nil),
-            count_of_extmarks_for_client(diagnostic_bufnr, 1),
-            count_of_extmarks_for_client(diagnostic_bufnr, 2),
-          }
-        ]])
-
-        -- Show diagnostics from server 1 again
-        eq(all_highlights, exec_lua([[
-          vim.lsp.diagnostic.display(nil, diagnostic_bufnr, 1)
-          return {
-            vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1),
-            vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Warning", 2),
-            vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Warning", nil),
-            count_of_extmarks_for_client(diagnostic_bufnr, 1),
-            count_of_extmarks_for_client(diagnostic_bufnr, 2),
-          }
-        ]]))
-      end)
-
-      describe('reset', function()
-        it('diagnostic count is 0 and displayed diagnostics are 0 after call', function()
-          -- 1 Error (1)
-          -- 1 Warning (2)
-          -- 1 Warning (2) + 1 Warning (1)
-          -- 2 highlights and 2 underlines (since error)
-          -- 1 highlight + 1 underline
-          local all_highlights = {1, 1, 2, 4, 2}
-          eq(all_highlights, exec_lua [[
-            local server_1_diags = {
-              make_error("Error 1", 1, 1, 1, 5),
-              make_warning("Warning on Server 1", 2, 1, 2, 5),
-            }
-            local server_2_diags = {
-              make_warning("Warning 1", 2, 1, 2, 5),
-            }
-
-            vim.lsp.diagnostic.on_publish_diagnostics(nil, nil, { uri = fake_uri, diagnostics = server_1_diags }, 1)
-            vim.lsp.diagnostic.on_publish_diagnostics(nil, nil, { uri = fake_uri, diagnostics = server_2_diags }, 2)
-            return {
-              vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1),
-              vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Warning", 2),
-              vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Warning", nil),
-              count_of_extmarks_for_client(diagnostic_bufnr, 1),
-              count_of_extmarks_for_client(diagnostic_bufnr, 2),
-            }
-          ]])
-
-          -- Reset diagnostics from server 1
-          exec_lua([[ vim.lsp.diagnostic.reset(1, { [ diagnostic_bufnr ] = { [ 1 ] = true ; [ 2 ] = true } } )]])
-
-          -- Make sure we have the right diagnostic count
-          eq({0, 1, 1, 0, 2} , exec_lua [[
-            local diagnostic_count = {}
-            vim.wait(100, function () diagnostic_count = {
-              vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1),
-              vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Warning", 2),
-              vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Warning", nil),
-              count_of_extmarks_for_client(diagnostic_bufnr, 1),
-              count_of_extmarks_for_client(diagnostic_bufnr, 2),
-            } end )
-            return diagnostic_count
-          ]])
-
-          -- Reset diagnostics from server 2
-          exec_lua([[ vim.lsp.diagnostic.reset(2, { [ diagnostic_bufnr ] = { [ 1 ] = true ; [ 2 ] = true } } )]])
-
-          -- Make sure we have the right diagnostic count
-          eq({0, 0, 0, 0, 0}, exec_lua [[
-            local diagnostic_count = {}
-            vim.wait(100, function () diagnostic_count = {
-              vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1),
-              vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Warning", 2),
-              vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Warning", nil),
-              count_of_extmarks_for_client(diagnostic_bufnr, 1),
-              count_of_extmarks_for_client(diagnostic_bufnr, 2),
-            } end )
-            return diagnostic_count
-          ]])
-
-          end)
-        end)
-
-      describe('get_next_diagnostic_pos', function()
-        it('can find the next pos with only one client', function()
-          eq({1, 1}, exec_lua [[
-            vim.lsp.diagnostic.save(
-              {
-                make_error('Diagnostic #1', 1, 1, 1, 1),
-              }, diagnostic_bufnr, 1
-            )
-            vim.api.nvim_win_set_buf(0, diagnostic_bufnr)
-            return vim.lsp.diagnostic.get_next_pos()
-          ]])
-        end)
-
-        it('can find next pos with two errors', function()
-          eq({4, 4}, exec_lua [[
-            vim.lsp.diagnostic.save(
-              {
-                make_error('Diagnostic #1', 1, 1, 1, 1),
-                make_error('Diagnostic #2', 4, 4, 4, 4),
-              }, diagnostic_bufnr, 1
-            )
-            vim.api.nvim_win_set_buf(0, diagnostic_bufnr)
-            vim.api.nvim_win_set_cursor(0, {3, 1})
-            return vim.lsp.diagnostic.get_next_pos { client_id = 1 }
-          ]])
-        end)
-
-        it('can cycle when position is past error', function()
-          eq({1, 1}, exec_lua [[
-            vim.lsp.diagnostic.save(
-              {
-                make_error('Diagnostic #1', 1, 1, 1, 1),
-              }, diagnostic_bufnr, 1
-            )
-            vim.api.nvim_win_set_buf(0, diagnostic_bufnr)
-            vim.api.nvim_win_set_cursor(0, {3, 1})
-            return vim.lsp.diagnostic.get_next_pos { client_id = 1 }
-          ]])
-        end)
-
-        it('will not cycle when wrap is off', function()
-          eq(false, exec_lua [[
-            vim.lsp.diagnostic.save(
-              {
-                make_error('Diagnostic #1', 1, 1, 1, 1),
-              }, diagnostic_bufnr, 1
-            )
-            vim.api.nvim_win_set_buf(0, diagnostic_bufnr)
-            vim.api.nvim_win_set_cursor(0, {3, 1})
-            return vim.lsp.diagnostic.get_next_pos { client_id = 1, wrap = false }
-          ]])
-        end)
-
-        it('can cycle even from the last line', function()
-          eq({4, 4}, exec_lua [[
-            vim.lsp.diagnostic.save(
-              {
-                make_error('Diagnostic #2', 4, 4, 4, 4),
-              }, diagnostic_bufnr, 1
-            )
-            vim.api.nvim_win_set_buf(0, diagnostic_bufnr)
-            vim.api.nvim_win_set_cursor(0, {vim.api.nvim_buf_line_count(0), 1})
-            return vim.lsp.diagnostic.get_prev_pos { client_id =  1 }
-          ]])
-        end)
-      end)
-
-      describe('get_prev_diagnostic_pos', function()
-        it('can find the prev pos with only one client', function()
-          eq({1, 1}, exec_lua [[
-            vim.lsp.diagnostic.save(
-              {
-                make_error('Diagnostic #1', 1, 1, 1, 1),
-              }, diagnostic_bufnr, 1
-            )
-            vim.api.nvim_win_set_buf(0, diagnostic_bufnr)
-            vim.api.nvim_win_set_cursor(0, {3, 1})
-            return vim.lsp.diagnostic.get_prev_pos()
-          ]])
-        end)
-
-        it('can find prev pos with two errors', function()
-          eq({1, 1}, exec_lua [[
-            vim.lsp.diagnostic.save(
-              {
-                make_error('Diagnostic #1', 1, 1, 1, 1),
-                make_error('Diagnostic #2', 4, 4, 4, 4),
-              }, diagnostic_bufnr, 1
-            )
-            vim.api.nvim_win_set_buf(0, diagnostic_bufnr)
-            vim.api.nvim_win_set_cursor(0, {3, 1})
-            return vim.lsp.diagnostic.get_prev_pos { client_id = 1 }
-          ]])
-        end)
-
-        it('can cycle when position is past error', function()
-          eq({4, 4}, exec_lua [[
-            vim.lsp.diagnostic.save(
-              {
-                make_error('Diagnostic #2', 4, 4, 4, 4),
-              }, diagnostic_bufnr, 1
-            )
-            vim.api.nvim_win_set_buf(0, diagnostic_bufnr)
-            vim.api.nvim_win_set_cursor(0, {3, 1})
-            return vim.lsp.diagnostic.get_prev_pos { client_id = 1 }
-          ]])
-        end)
-
-        it('respects wrap parameter', function()
-          eq(false, exec_lua [[
-            vim.lsp.diagnostic.save(
-              {
-                make_error('Diagnostic #2', 4, 4, 4, 4),
-              }, diagnostic_bufnr, 1
-            )
-            vim.api.nvim_win_set_buf(0, diagnostic_bufnr)
-            vim.api.nvim_win_set_cursor(0, {3, 1})
-            return vim.lsp.diagnostic.get_prev_pos { client_id = 1, wrap = false}
-          ]])
-        end)
-      end)
+      vim.api.nvim_win_set_buf(0, diagnostic_bufnr)
     end)
   end)
 
-  describe("vim.lsp.diagnostic.get_line_diagnostics", function()
-    it('should return an empty table when no diagnostics are present', function()
-      eq({}, exec_lua [[return vim.lsp.diagnostic.get_line_diagnostics(diagnostic_bufnr, 1)]])
-    end)
-
-    it('should return all diagnostics when no severity is supplied', function()
-      eq(2, exec_lua [[
-        vim.lsp.diagnostic.on_publish_diagnostics(nil, nil, {
-          uri = fake_uri,
-          diagnostics = {
-            make_error("Error 1", 1, 1, 1, 5),
-            make_warning("Warning on Server 1", 1, 1, 2, 5),
-            make_error("Error On Other Line", 2, 1, 1, 5),
-          }
-        }, 1)
-
-        return #vim.lsp.diagnostic.get_line_diagnostics(diagnostic_bufnr, 1)
-      ]])
-    end)
-
-    it('should return only requested diagnostics when severity_limit is supplied', function()
-      eq(2, exec_lua [[
-        vim.lsp.diagnostic.on_publish_diagnostics(nil, nil, {
-          uri = fake_uri,
-          diagnostics = {
-            make_error("Error 1", 1, 1, 1, 5),
-            make_warning("Warning on Server 1", 1, 1, 2, 5),
-            make_information("Ignored information", 1, 1, 2, 5),
-            make_error("Error On Other Line", 2, 1, 1, 5),
-          }
-        }, 1)
-
-        return #vim.lsp.diagnostic.get_line_diagnostics(diagnostic_bufnr, 1, { severity_limit = "Warning" })
-      ]])
-    end)
-  end)
-
-  describe("vim.lsp.diagnostic.on_publish_diagnostics", function()
-    it('can use functions for config values', function()
-      exec_lua [[
-        vim.lsp.with(vim.lsp.diagnostic.on_publish_diagnostics, {
-          virtual_text = function() return true end,
-        })(nil, nil, {
-            uri = fake_uri,
-            diagnostics = {
-              make_error('Delayed Diagnostic', 4, 4, 4, 4),
-            }
-          }, 1
-        )
-      ]]
-
-      eq(1, exec_lua [[return vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1)]])
-      eq(2, exec_lua [[return count_of_extmarks_for_client(diagnostic_bufnr, 1)]])
-
-      -- Now, don't enable virtual text.
-      -- We should have one less extmark displayed.
-      exec_lua [[
-        vim.lsp.with(vim.lsp.diagnostic.on_publish_diagnostics, {
-          virtual_text = function() return false end,
-        })(nil, nil, {
-            uri = fake_uri,
-            diagnostics = {
-              make_error('Delayed Diagnostic', 4, 4, 4, 4),
-            }
-          }, 1
-        )
-      ]]
-
-      eq(1, exec_lua [[return vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1)]])
-      eq(1, exec_lua [[return count_of_extmarks_for_client(diagnostic_bufnr, 1)]])
-    end)
-
-    it('can perform updates after insert_leave', function()
-      exec_lua [[vim.api.nvim_set_current_buf(diagnostic_bufnr)]]
-      nvim("input", "o")
-      eq({mode='i', blocking=false}, nvim("get_mode"))
-
-      -- Save the diagnostics
-      exec_lua [[
-        vim.lsp.with(vim.lsp.diagnostic.on_publish_diagnostics, {
-          update_in_insert = false,
-        })(nil, nil, {
-            uri = fake_uri,
-            diagnostics = {
-              make_error('Delayed Diagnostic', 4, 4, 4, 4),
-            }
-          }, 1
-        )
-      ]]
-
-      -- No diagnostics displayed yet.
-      eq({mode='i', blocking=false}, nvim("get_mode"))
-      eq(1, exec_lua [[return vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1)]])
-      eq(0, exec_lua [[return count_of_extmarks_for_client(diagnostic_bufnr, 1)]])
-
-      nvim("input", "<esc>")
-      eq({mode='n', blocking=false}, nvim("get_mode"))
-
-      eq(1, exec_lua [[return vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1)]])
-      eq(2, exec_lua [[return count_of_extmarks_for_client(diagnostic_bufnr, 1)]])
-    end)
-
-    it('does not perform updates when not needed', function()
-      exec_lua [[vim.api.nvim_set_current_buf(diagnostic_bufnr)]]
-      nvim("input", "o")
-      eq({mode='i', blocking=false}, nvim("get_mode"))
-
-      -- Save the diagnostics
-      exec_lua [[
-        PublishDiagnostics = vim.lsp.with(vim.lsp.diagnostic.on_publish_diagnostics, {
-          update_in_insert = false,
-          virtual_text = true,
-        })
-
-        -- Count how many times we call display.
-        SetVirtualTextOriginal = vim.lsp.diagnostic.set_virtual_text
-
-        DisplayCount = 0
-        vim.lsp.diagnostic.set_virtual_text = function(...)
-          DisplayCount = DisplayCount + 1
-          return SetVirtualTextOriginal(...)
-        end
-
-        PublishDiagnostics(nil, nil, {
-            uri = fake_uri,
-            diagnostics = {
-              make_error('Delayed Diagnostic', 4, 4, 4, 4),
-            }
-          }, 1
-        )
-      ]]
-
-      -- No diagnostics displayed yet.
-      eq({mode='i', blocking=false}, nvim("get_mode"))
-      eq(1, exec_lua [[return vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1)]])
-      eq(0, exec_lua [[return count_of_extmarks_for_client(diagnostic_bufnr, 1)]])
-      eq(0, exec_lua [[return DisplayCount]])
-
-      nvim("input", "<esc>")
-      eq({mode='n', blocking=false}, nvim("get_mode"))
-
-      eq(1, exec_lua [[return vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1)]])
-      eq(2, exec_lua [[return count_of_extmarks_for_client(diagnostic_bufnr, 1)]])
-      eq(1, exec_lua [[return DisplayCount]])
-
-      -- Go in and out of insert mode one more time.
-      nvim("input", "o")
-      eq({mode='i', blocking=false}, nvim("get_mode"))
-
-      nvim("input", "<esc>")
-      eq({mode='n', blocking=false}, nvim("get_mode"))
-
-      -- Should not have set the virtual text again.
-      eq(1, exec_lua [[return DisplayCount]])
-    end)
-
-    it('never sets virtual text, in combination with insert leave', function()
-      exec_lua [[vim.api.nvim_set_current_buf(diagnostic_bufnr)]]
-      nvim("input", "o")
-      eq({mode='i', blocking=false}, nvim("get_mode"))
-
-      -- Save the diagnostics
-      exec_lua [[
-        PublishDiagnostics = vim.lsp.with(vim.lsp.diagnostic.on_publish_diagnostics, {
-          update_in_insert = false,
-          virtual_text = false,
-        })
-
-        -- Count how many times we call display.
-        SetVirtualTextOriginal = vim.lsp.diagnostic.set_virtual_text
-
-        DisplayCount = 0
-        vim.lsp.diagnostic.set_virtual_text = function(...)
-          DisplayCount = DisplayCount + 1
-          return SetVirtualTextOriginal(...)
-        end
-
-        PublishDiagnostics(nil, nil, {
-            uri = fake_uri,
-            diagnostics = {
-              make_error('Delayed Diagnostic', 4, 4, 4, 4),
-            }
-          }, 1
-        )
-      ]]
-
-      -- No diagnostics displayed yet.
-      eq({mode='i', blocking=false}, nvim("get_mode"))
-      eq(1, exec_lua [[return vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1)]])
-      eq(0, exec_lua [[return count_of_extmarks_for_client(diagnostic_bufnr, 1)]])
-      eq(0, exec_lua [[return DisplayCount]])
-
-      nvim("input", "<esc>")
-      eq({mode='n', blocking=false}, nvim("get_mode"))
-
-      eq(1, exec_lua [[return vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1)]])
-      eq(1, exec_lua [[return count_of_extmarks_for_client(diagnostic_bufnr, 1)]])
-      eq(0, exec_lua [[return DisplayCount]])
-
-      -- Go in and out of insert mode one more time.
-      nvim("input", "o")
-      eq({mode='i', blocking=false}, nvim("get_mode"))
-
-      nvim("input", "<esc>")
-      eq({mode='n', blocking=false}, nvim("get_mode"))
-
-      -- Should not have set the virtual text still.
-      eq(0, exec_lua [[return DisplayCount]])
-    end)
-
-    it('can perform updates while in insert mode, if desired', function()
-      exec_lua [[vim.api.nvim_set_current_buf(diagnostic_bufnr)]]
-      nvim("input", "o")
-      eq({mode='i', blocking=false}, nvim("get_mode"))
-
-      -- Save the diagnostics
-      exec_lua [[
-        vim.lsp.with(vim.lsp.diagnostic.on_publish_diagnostics, {
-          update_in_insert = true,
-        })(nil, nil, {
-            uri = fake_uri,
-            diagnostics = {
-              make_error('Delayed Diagnostic', 4, 4, 4, 4),
-            }
-          }, 1
-        )
-      ]]
-
-      -- Diagnostics are displayed, because the user wanted them that way!
-      eq({mode='i', blocking=false}, nvim("get_mode"))
-      eq(1, exec_lua [[return vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1)]])
-      eq(2, exec_lua [[return count_of_extmarks_for_client(diagnostic_bufnr, 1)]])
-
-      nvim("input", "<esc>")
-      eq({mode='n', blocking=false}, nvim("get_mode"))
-
-      eq(1, exec_lua [[return vim.lsp.diagnostic.get_count(diagnostic_bufnr, "Error", 1)]])
-      eq(2, exec_lua [[return count_of_extmarks_for_client(diagnostic_bufnr, 1)]])
-    end)
-
-    it('allows configuring the virtual text via vim.lsp.with', function()
-      local expected_spacing = 10
-      local extmarks = exec_lua([[
-        PublishDiagnostics = vim.lsp.with(vim.lsp.diagnostic.on_publish_diagnostics, {
-          virtual_text = {
-            spacing = ...,
+  describe('vim.lsp.diagnostic.on_publish_diagnostics', function()
+    before_each(function()
+      exec_lua(create_server_definition)
+      exec_lua(function()
+        _G.requests = 0
+        _G.server = _G._create_server({
+          capabilities = {
+            diagnosticProvider = {},
           },
         })
 
-        PublishDiagnostics(nil, nil, {
-            uri = fake_uri,
-            diagnostics = {
-              make_error('Delayed Diagnostic', 4, 4, 4, 4),
-            }
-          }, 1
-        )
-
-        return vim.api.nvim_buf_get_extmarks(
-          diagnostic_bufnr,
-          vim.lsp.diagnostic._get_diagnostic_namespace(1),
-          0,
-          -1,
-          { details = true }
-        )
-      ]], expected_spacing)
-
-      local virt_text = extmarks[1][4].virt_text
-      local spacing = virt_text[1][1]
-
-      eq(expected_spacing, #spacing)
+        client_id = assert(vim.lsp.start({ name = 'dummy', cmd = _G.server.cmd }))
+      end)
     end)
 
+    after_each(function()
+      exec_lua(function()
+        local client = vim.lsp.get_client_by_id(client_id)
+        if client then
+          client:stop()
+        end
 
-    it('allows configuring the virtual text via vim.lsp.with using a function', function()
-      local expected_spacing = 10
-      local extmarks = exec_lua([[
-        spacing = ...
+        vim.api.nvim_exec_autocmds('VimLeavePre', { modeline = false })
+      end)
+    end)
 
-        PublishDiagnostics = vim.lsp.with(vim.lsp.diagnostic.on_publish_diagnostics, {
-          virtual_text = function()
-            return {
-              spacing = spacing,
-            }
-          end,
+    it('correctly handles UTF-16 offsets', function()
+      local line = 'All 💼 and no 🎉 makes Jack a dull 👦'
+      local result = exec_lua(function()
+        vim.api.nvim_buf_set_lines(diagnostic_bufnr, 0, -1, false, { line })
+
+        vim.lsp.diagnostic.on_publish_diagnostics(nil, {
+          uri = fake_uri,
+          diagnostics = {
+            _G.make_error('UTF-16 Diagnostic', 0, 7, 0, 8),
+          },
+        }, { client_id = client_id })
+
+        local diags = vim.diagnostic.get(diagnostic_bufnr)
+        return diags
+      end)
+      eq(1, #result)
+      eq(
+        exec_lua(function()
+          return vim.str_byteindex(line, 'utf-16', 7)
+        end),
+        result[1].col
+      )
+      eq(
+        exec_lua(function()
+          return vim.str_byteindex(line, 'utf-16', 8)
+        end),
+        result[1].end_col
+      )
+    end)
+
+    it('does not create buffer on empty diagnostics', function()
+      -- No buffer is created without diagnostics
+      eq(
+        -1,
+        exec_lua(function()
+          vim.lsp.diagnostic.on_publish_diagnostics(nil, {
+            uri = 'file:///fake/uri2',
+            diagnostics = {},
+          }, { client_id = client_id })
+          return vim.fn.bufnr(vim.uri.to_fname('file:///fake/uri2'))
+        end)
+      )
+
+      -- Create buffer on diagnostics
+      neq(
+        -1,
+        exec_lua(function()
+          vim.lsp.diagnostic.on_publish_diagnostics(nil, {
+            uri = 'file:///fake/uri2',
+            diagnostics = {
+              _G.make_error('Diagnostic', 0, 0, 0, 0),
+            },
+          }, { client_id = client_id })
+          return vim.fn.bufnr(vim.uri.to_fname('file:///fake/uri2'))
+        end)
+      )
+      eq(
+        1,
+        exec_lua(function()
+          return #vim.diagnostic.get(_G.bufnr)
+        end)
+      )
+
+      -- Clear diagnostics after buffer was created
+      neq(
+        -1,
+        exec_lua(function()
+          vim.lsp.diagnostic.on_publish_diagnostics(nil, {
+            uri = 'file:///fake/uri2',
+            diagnostics = {},
+          }, { client_id = client_id })
+          return vim.fn.bufnr(vim.uri.to_fname('file:///fake/uri2'))
+        end)
+      )
+      eq(
+        0,
+        exec_lua(function()
+          return #vim.diagnostic.get(_G.bufnr)
+        end)
+      )
+    end)
+
+    it('clears diagnostics for the client namespace on empty publish', function()
+      local before_clear, after_clear = exec_lua(function()
+        local ns = vim.lsp.diagnostic.get_namespace(client_id)
+
+        -- Publish diagnostics
+        vim.lsp.diagnostic.on_publish_diagnostics(nil, {
+          uri = fake_uri,
+          diagnostics = {
+            _G.make_error('Diagnostic', 0, 0, 0, 0),
+          },
+        }, { client_id = client_id })
+
+        local before_clear = vim.diagnostic.get(diagnostic_bufnr, { namespace = ns })
+
+        -- Publish empty diagnostics
+        vim.lsp.diagnostic.on_publish_diagnostics(nil, {
+          uri = fake_uri,
+          diagnostics = {},
+        }, { client_id = client_id })
+
+        local after_clear = vim.diagnostic.get(diagnostic_bufnr, { namespace = ns })
+
+        return before_clear, after_clear
+      end)
+
+      eq(1, #before_clear)
+      eq(0, #after_clear)
+    end)
+
+    it('clears diagnostics when buffer is deleted', function()
+      local before_delete, after_delete = exec_lua(function()
+        local ns = vim.lsp.diagnostic.get_namespace(client_id)
+
+        -- Publish diagnostics
+        vim.lsp.diagnostic.on_publish_diagnostics(nil, {
+          uri = fake_uri,
+          diagnostics = {
+            _G.make_error('Diagnostic', 0, 0, 0, 0),
+          },
+        }, { client_id = client_id })
+
+        local before_delete = vim.diagnostic.get(diagnostic_bufnr, { namespace = ns })
+
+        -- Avoid deleting the currently displayed buffer (Windows teardown edge case)
+        local scratch = vim.api.nvim_create_buf(false, true)
+        vim.api.nvim_win_set_buf(0, scratch)
+
+        -- Delete the buffer deterministically
+        vim.api.nvim_buf_delete(diagnostic_bufnr, { force = true })
+
+        -- Query remaining diagnostics via valid access path
+        -- (deleted buffer cannot be queried directly)
+        local after_delete = vim.diagnostic.get(nil, { namespace = ns })
+
+        return before_delete, after_delete
+      end)
+
+      eq(1, #before_delete)
+      eq(0, #after_delete)
+    end)
+
+    it('clears diagnostics when client is detached', function()
+      exec_lua(function()
+        vim.lsp.diagnostic.on_publish_diagnostics(nil, {
+          uri = fake_uri,
+          diagnostics = {
+            _G.make_error('Diagnostic', 0, 0, 0, 0),
+          },
+        }, { client_id = client_id })
+      end)
+
+      eq(
+        1,
+        exec_lua(function()
+          local ns = vim.lsp.diagnostic.get_namespace(client_id)
+          return #vim.diagnostic.get(diagnostic_bufnr, { namespace = ns })
+        end)
+      )
+
+      exec_lua(function()
+        vim.lsp.get_client_by_id(client_id):stop()
+      end)
+
+      eq(
+        0,
+        exec_lua(function()
+          local ns = vim.lsp.diagnostic.get_namespace(client_id)
+          return #vim.diagnostic.get(diagnostic_bufnr, { namespace = ns })
+        end)
+      )
+    end)
+
+    it('errors when diagnostic tags is null', function()
+      matches(
+        'server response has invalid %(null%) tags',
+        pcall_err(exec_lua, function()
+          vim.lsp.diagnostic.on_publish_diagnostics(nil, {
+            uri = fake_uri,
+            diagnostics = {
+              vim.tbl_extend('force', _G.make_error('Diagnostic', 0, 0, 0, 0), { tags = vim.NIL }),
+            },
+          }, { client_id = client_id })
+        end)
+      )
+    end)
+  end)
+
+  describe('vim.lsp.diagnostic.on_diagnostic', function()
+    before_each(function()
+      exec_lua(create_server_definition)
+      exec_lua(function()
+        _G.requests = 0
+        _G.server = _G._create_server({
+          capabilities = {
+            diagnosticProvider = {
+              documentSelector = vim.NIL,
+              interFileDependencies = false,
+              workspaceDiagnostics = false,
+            },
+          },
+          handlers = {
+            ['textDocument/diagnostic'] = function(_, params)
+              _G.params = params
+              _G.requests = _G.requests + 1
+            end,
+          },
         })
 
-        PublishDiagnostics(nil, nil, {
-            uri = fake_uri,
-            diagnostics = {
-              make_error('Delayed Diagnostic', 4, 4, 4, 4),
-            }
-          }, 1
-        )
+        function _G.get_extmarks(bufnr, client_id0)
+          local namespace = vim.lsp.diagnostic.get_namespace(client_id0, true)
+          local ns = vim.diagnostic.get_namespace(namespace)
+          local extmarks = {}
+          if ns.user_data.virt_text_ns then
+            for _, e in
+              pairs(
+                vim.api.nvim_buf_get_extmarks(
+                  bufnr,
+                  ns.user_data.virt_text_ns,
+                  0,
+                  -1,
+                  { details = true }
+                )
+              )
+            do
+              table.insert(extmarks, e)
+            end
+          end
+          if ns.user_data.underline_ns then
+            for _, e in
+              pairs(
+                vim.api.nvim_buf_get_extmarks(
+                  bufnr,
+                  ns.user_data.underline_ns,
+                  0,
+                  -1,
+                  { details = true }
+                )
+              )
+            do
+              table.insert(extmarks, e)
+            end
+          end
+          return extmarks
+        end
 
-        return vim.api.nvim_buf_get_extmarks(
-          diagnostic_bufnr,
-          vim.lsp.diagnostic._get_diagnostic_namespace(1),
-          0,
-          -1,
-          { details = true }
-        )
-      ]], expected_spacing)
-
-      local virt_text = extmarks[1][4].virt_text
-      local spacing = virt_text[1][1]
-
-      eq(expected_spacing, #spacing)
+        client_id = assert(vim.lsp.start({ name = 'dummy', cmd = _G.server.cmd }))
+      end)
     end)
 
-    it('allows filtering via severity limit', function()
-      local get_extmark_count_with_severity = function(severity_limit)
-        return exec_lua([[
-          PublishDiagnostics = vim.lsp.with(vim.lsp.diagnostic.on_publish_diagnostics, {
-            underline = false,
-            virtual_text = {
-              severity_limit = ...
+    it('adds diagnostics to vim.diagnostics', function()
+      local diags = exec_lua(function()
+        vim.lsp.diagnostic.on_diagnostic(nil, {
+          kind = 'full',
+          items = {
+            _G.make_error('Pull Diagnostic', 4, 4, 4, 4),
+          },
+        }, {
+          params = {
+            textDocument = { uri = fake_uri },
+          },
+          uri = fake_uri,
+          client_id = client_id,
+          bufnr = diagnostic_bufnr,
+        }, {})
+
+        return vim.diagnostic.get(diagnostic_bufnr)
+      end)
+      eq(1, #diags)
+      eq('Pull Diagnostic', diags[1].message)
+    end)
+
+    it('preserves push diagnostics when pull diagnostics are empty', function()
+      local push_ns_count, pull_ns_count, all_diags_count, push_ns, pull_ns = exec_lua(function()
+        vim.lsp.diagnostic.on_publish_diagnostics(nil, {
+          uri = fake_uri,
+          diagnostics = {
+            _G.make_error('Push Diagnostic', 0, 0, 0, 0),
+          },
+        }, { client_id = client_id })
+
+        vim.lsp.diagnostic.on_diagnostic(nil, {
+          kind = 'full',
+          items = {},
+        }, {
+          params = {
+            textDocument = { uri = fake_uri },
+          },
+          uri = fake_uri,
+          client_id = client_id,
+          bufnr = diagnostic_bufnr,
+        }, {})
+
+        local push_ns = vim.lsp.diagnostic.get_namespace(client_id, false)
+        local pull_ns = vim.lsp.diagnostic.get_namespace(client_id, true)
+
+        return #vim.diagnostic.get(diagnostic_bufnr, { namespace = push_ns }),
+          #vim.diagnostic.get(diagnostic_bufnr, { namespace = pull_ns }),
+          #vim.diagnostic.get(diagnostic_bufnr),
+          push_ns,
+          pull_ns
+      end)
+
+      eq(1, push_ns_count)
+      eq(0, pull_ns_count)
+      eq(1, all_diags_count)
+      neq(push_ns, pull_ns)
+    end)
+
+    it('uses pull_id to isolate pull diagnostic namespaces', function()
+      local first_count, second_count, total_count, first_ns, second_ns = exec_lua(function()
+        vim.lsp.diagnostic.on_diagnostic(nil, {
+          kind = 'full',
+          items = {
+            _G.make_error('Pull Diagnostic A', 0, 0, 0, 0),
+          },
+        }, {
+          params = {
+            identifier = 'provider-a',
+            textDocument = { uri = fake_uri },
+          },
+          uri = fake_uri,
+          client_id = client_id,
+          bufnr = diagnostic_bufnr,
+        }, {})
+
+        vim.lsp.diagnostic.on_diagnostic(nil, {
+          kind = 'full',
+          items = {},
+        }, {
+          params = {
+            identifier = 'provider-b',
+            textDocument = { uri = fake_uri },
+          },
+          uri = fake_uri,
+          client_id = client_id,
+          bufnr = diagnostic_bufnr,
+        }, {})
+
+        local first_ns = vim.lsp.diagnostic.get_namespace(client_id, true, 'provider-a')
+        local second_ns = vim.lsp.diagnostic.get_namespace(client_id, true, 'provider-b')
+
+        return #vim.diagnostic.get(diagnostic_bufnr, { namespace = first_ns }),
+          #vim.diagnostic.get(diagnostic_bufnr, { namespace = second_ns }),
+          #vim.diagnostic.get(diagnostic_bufnr),
+          first_ns,
+          second_ns
+      end)
+
+      eq(1, first_count)
+      eq(0, second_count)
+      eq(1, total_count)
+      neq(first_ns, second_ns)
+    end)
+
+    it('handles multiline diagnostic ranges #33782', function()
+      local diags = exec_lua(function()
+        vim.lsp.diagnostic.on_diagnostic(nil, {
+          kind = 'full',
+          items = {
+            _G.make_error('Pull Diagnostic', 0, 6, 1, 10),
+          },
+        }, {
+          params = {
+            textDocument = { uri = fake_uri },
+          },
+          uri = fake_uri,
+          client_id = client_id,
+          bufnr = diagnostic_bufnr,
+        }, {})
+
+        return vim.diagnostic.get(diagnostic_bufnr)
+      end)
+      local lines = exec_lua(function()
+        return vim.api.nvim_buf_get_lines(diagnostic_bufnr, 0, -1, false)
+      end)
+      -- This test case must be run over a multiline diagnostic in which the start line is shorter
+      -- than the end line, and the end_col exceeds the start line's length.
+      eq(8, #lines[1])
+      eq(16, #lines[2])
+      eq(1, #diags)
+      eq(6, diags[1].col)
+      eq(10, diags[1].end_col)
+    end)
+
+    it('severity defaults to error if missing', function()
+      ---@type vim.Diagnostic[]
+      local diagnostics = exec_lua(function()
+        vim.lsp.diagnostic.on_diagnostic(nil, {
+          kind = 'full',
+          items = {
+            {
+              range = _G.make_range(4, 4, 4, 4),
+              message = 'bad!',
             },
+          },
+        }, {
+          params = {
+            textDocument = { uri = fake_uri },
+          },
+          uri = fake_uri,
+          client_id = client_id,
+          bufnr = diagnostic_bufnr,
+        }, {})
+        return vim.diagnostic.get(diagnostic_bufnr)
+      end)
+      eq(1, #diagnostics)
+      eq(1, diagnostics[1].severity)
+    end)
+
+    it('clears pull diagnostics when client detaches', function()
+      exec_lua(function()
+        vim.lsp.diagnostic.on_diagnostic(nil, {
+          kind = 'full',
+          items = {
+            _G.make_error('Pull Diagnostic', 4, 4, 4, 4),
+          },
+        }, {
+          params = {
+            textDocument = { uri = fake_uri },
+          },
+          uri = fake_uri,
+          client_id = client_id,
+          bufnr = diagnostic_bufnr,
+        }, {})
+      end)
+
+      eq(
+        1,
+        exec_lua(function()
+          return #vim.diagnostic.get(diagnostic_bufnr)
+        end)
+      )
+
+      exec_lua(function()
+        vim.lsp.get_client_by_id(client_id):stop()
+      end)
+
+      eq(
+        0,
+        exec_lua(function()
+          return #vim.diagnostic.get(diagnostic_bufnr)
+        end)
+      )
+    end)
+
+    it('keeps diagnostics when one client detaches and others still are attached', function()
+      exec_lua(function()
+        _G.client_id2 = assert(vim.lsp.start({ name = 'dummy2', cmd = _G.server.cmd }))
+
+        vim.lsp.diagnostic.on_diagnostic(nil, {
+          kind = 'full',
+          items = {
+            _G.make_error('Pull Diagnostic', 4, 4, 4, 4),
+          },
+        }, {
+          params = {
+            textDocument = { uri = fake_uri },
+          },
+          uri = fake_uri,
+          client_id = client_id,
+          bufnr = diagnostic_bufnr,
+        }, {})
+      end)
+
+      eq(
+        1,
+        exec_lua(function()
+          return #vim.diagnostic.get(diagnostic_bufnr)
+        end)
+      )
+
+      exec_lua(function()
+        vim.lsp.get_client_by_id(_G.client_id2):stop()
+      end)
+
+      eq(
+        1,
+        exec_lua(function()
+          return #vim.diagnostic.get(diagnostic_bufnr)
+        end)
+      )
+    end)
+
+    it('handles server cancellation', function()
+      eq(
+        2,
+        exec_lua(function()
+          vim.lsp.diagnostic.on_diagnostic({
+            code = vim.lsp.protocol.ErrorCodes.ServerCancelled,
+            -- Empty data defaults to retriggering request
+            data = {},
+            message = '',
+          }, {}, {
+            method = 'textDocument/diagnostic',
+            client_id = client_id,
+            bufnr = diagnostic_bufnr,
           })
 
-          PublishDiagnostics(nil, nil, {
-              uri = fake_uri,
-              diagnostics = {
-                make_warning('Delayed Diagnostic', 4, 4, 4, 4),
-              }
-            }, 1
-          )
+          return _G.requests
+        end)
+      )
 
-          return count_of_extmarks_for_client(diagnostic_bufnr, 1)
-        ]], severity_limit)
-      end
+      eq(
+        3,
+        exec_lua(function()
+          vim.lsp.diagnostic.on_diagnostic({
+            code = vim.lsp.protocol.ErrorCodes.ServerCancelled,
+            data = { retriggerRequest = true },
+            message = '',
+          }, {}, {
+            method = 'textDocument/diagnostic',
+            client_id = client_id,
+            bufnr = diagnostic_bufnr,
+          })
 
-      -- No messages with Error or higher
-      eq(0, get_extmark_count_with_severity("Error"))
+          return _G.requests
+        end)
+      )
 
-      -- But now we don't filter it
-      eq(1, get_extmark_count_with_severity("Warning"))
-      eq(1, get_extmark_count_with_severity("Hint"))
+      eq(
+        3,
+        exec_lua(function()
+          vim.lsp.diagnostic.on_diagnostic({
+            code = vim.lsp.protocol.ErrorCodes.ServerCancelled,
+            data = { retriggerRequest = false },
+            message = '',
+          }, {}, {
+            method = 'textDocument/diagnostic',
+            client_id = client_id,
+            bufnr = diagnostic_bufnr,
+          })
+
+          return _G.requests
+        end)
+      )
     end)
-  end)
 
-  describe('lsp.util.show_line_diagnostics', function()
-    it('creates floating window and returns popup bufnr and winnr if current line contains diagnostics', function()
-      -- Two lines:
-      --    Diagnostic:
-      --    1. <msg>
-      eq(2, exec_lua [[
-        local buffer = vim.api.nvim_create_buf(false, true)
-        vim.api.nvim_buf_set_lines(buffer, 0, -1, false, {
-          "testing";
-          "123";
-        })
-        local diagnostics = {
-          {
-            range = {
-              start = { line = 0; character = 1; };
-              ["end"] = { line = 0; character = 3; };
-            };
-            severity = vim.lsp.protocol.DiagnosticSeverity.Error;
-            message = "Syntax error";
+    it('supports dynamic registration', function()
+      exec_lua(create_server_definition)
+      exec_lua(function()
+        _G.server2 = _G._create_server({
+          diagnosticProvider = {
+            documentSelector = vim.NIL,
           },
-        }
-        vim.api.nvim_win_set_buf(0, buffer)
-        vim.lsp.diagnostic.save(diagnostics, buffer, 1)
-        local popup_bufnr, winnr = vim.lsp.diagnostic.show_line_diagnostics()
-        return #vim.api.nvim_buf_get_lines(popup_bufnr, 0, -1, false)
-      ]])
-    end)
-
-    it('creates floating window and returns popup bufnr and winnr without header, if requested', function()
-      -- One line (since no header):
-      --    1. <msg>
-      eq(1, exec_lua [[
-        local buffer = vim.api.nvim_create_buf(false, true)
-        vim.api.nvim_buf_set_lines(buffer, 0, -1, false, {
-          "testing";
-          "123";
-        })
-        local diagnostics = {
-          {
-            range = {
-              start = { line = 0; character = 1; };
-              ["end"] = { line = 0; character = 3; };
-            };
-            severity = vim.lsp.protocol.DiagnosticSeverity.Error;
-            message = "Syntax error";
+          handlers = {
+            ['textDocument/diagnostic'] = function(_, _, callback)
+              callback(nil, {
+                kind = 'full',
+                items = {
+                  _G.make_error('Dynamic Diagnostic', 4, 4, 4, 4),
+                },
+              })
+            end,
           },
-        }
-        vim.api.nvim_win_set_buf(0, buffer)
-        vim.lsp.diagnostic.save(diagnostics, buffer, 1)
-        local popup_bufnr, winnr = vim.lsp.diagnostic.show_line_diagnostics { show_header = false }
-        return #vim.api.nvim_buf_get_lines(popup_bufnr, 0, -1, false)
-      ]])
-    end)
-  end)
-
-  describe('set_signs', function()
-    -- TODO(tjdevries): Find out why signs are not displayed when set from Lua...??
-    pending('sets signs by default', function()
-      exec_lua [[
-        PublishDiagnostics = vim.lsp.with(vim.lsp.diagnostic.on_publish_diagnostics, {
-          update_in_insert = true,
-          signs = true,
         })
 
-        local diagnostics = {
-          make_error('Delayed Diagnostic', 1, 1, 1, 2),
-          make_error('Delayed Diagnostic', 3, 3, 3, 3),
-        }
+        local client_id2 = assert(vim.lsp.start({ name = 'dummy2', cmd = _G.server2.cmd }))
 
-        vim.api.nvim_win_set_buf(0, diagnostic_bufnr)
-        vim.lsp.diagnostic.on_publish_diagnostics(nil, nil, {
-            uri = fake_uri,
-            diagnostics = diagnostics
-          }, 1
-        )
+        vim.lsp.handlers['client/registerCapability'](nil, {
+          registrations = {
+            { id = 'diagnostic', method = 'textDocument/diagnostic' },
+          },
+        }, { client_id = client_id2, method = 'client/registerCapability' })
+      end)
 
-        vim.lsp.diagnostic.set_signs(diagnostics, diagnostic_bufnr, 1)
-        -- return vim.fn.sign_getplaced()
-      ]]
+      eq(
+        1,
+        exec_lua(function()
+          return #vim.diagnostic.get(diagnostic_bufnr)
+        end)
+      )
+    end)
 
-      nvim("input", "o")
-      nvim("input", "<esc>")
+    it('requests with the `previousResultId`', function()
+      -- Full reports
+      eq(
+        'dummy_server',
+        exec_lua(function()
+          vim.lsp.diagnostic.on_diagnostic(nil, {
+            kind = 'full',
+            resultId = 'dummy_server',
+            items = {
+              _G.make_error('Pull Diagnostic', 4, 4, 4, 4),
+            },
+          }, {
+            method = 'textDocument/diagnostic',
+            params = {
+              textDocument = { uri = fake_uri },
+            },
+            client_id = client_id,
+            bufnr = diagnostic_bufnr,
+          })
+          vim.api.nvim_exec_autocmds('LspNotify', {
+            buf = diagnostic_bufnr,
+            data = {
+              method = 'textDocument/didChange',
+              client_id = client_id,
+            },
+          })
+          return _G.params.previousResultId
+        end)
+      )
 
-      -- TODO(tjdevries): Find a way to get the signs to display in the test...
-      eq(nil, exec_lua [[
-        return im.fn.sign_getplaced()[1].signs
-      ]])
+      -- Unchanged reports
+      eq(
+        'squidward',
+        exec_lua(function()
+          vim.lsp.diagnostic.on_diagnostic(nil, {
+            kind = 'unchanged',
+            resultId = 'squidward',
+          }, {
+            method = 'textDocument/diagnostic',
+            params = {
+              textDocument = { uri = fake_uri },
+            },
+            client_id = client_id,
+            bufnr = diagnostic_bufnr,
+          })
+          vim.api.nvim_exec_autocmds('LspNotify', {
+            buf = diagnostic_bufnr,
+            data = {
+              method = 'textDocument/didChange',
+              client_id = client_id,
+            },
+          })
+          return _G.params.previousResultId
+        end)
+      )
+    end)
+
+    it('handles relatedDocuments diagnostics', function()
+      local fake_uri_2 = 'file:///fake/uri2'
+      ---@type vim.Diagnostic[], vim.Diagnostic[], string?
+      local diagnostics, related_diagnostics, relatedPreviousResultId = exec_lua(function()
+        local second_buf = vim.uri.to_buf(fake_uri_2)
+        vim.fn.bufload(second_buf)
+
+        -- Attach the client to both buffers.
+        vim.api.nvim_win_set_buf(0, second_buf)
+        vim.lsp.start({ name = 'dummy', cmd = _G.server.cmd })
+
+        vim.lsp.diagnostic.on_diagnostic(nil, {
+          kind = 'full',
+          relatedDocuments = {
+            [fake_uri_2] = {
+              kind = 'full',
+              resultId = 'spongebob',
+              items = {
+                {
+                  range = _G.make_range(4, 4, 4, 4),
+                  message = 'related bad!',
+                },
+              },
+            },
+          },
+          items = {},
+        }, {
+          params = {
+            textDocument = { uri = fake_uri },
+          },
+          uri = fake_uri,
+          client_id = client_id,
+          bufnr = diagnostic_bufnr,
+        }, {})
+
+        vim.api.nvim_exec_autocmds('LspNotify', {
+          buf = second_buf,
+          data = {
+            method = 'textDocument/didChange',
+            client_id = client_id,
+          },
+        })
+
+        return vim.diagnostic.get(diagnostic_bufnr),
+          vim.diagnostic.get(second_buf),
+          _G.params.previousResultId
+      end)
+      eq(0, #diagnostics)
+      eq(1, #related_diagnostics)
+      eq('related bad!', related_diagnostics[1].message)
+      eq('spongebob', relatedPreviousResultId)
     end)
   end)
 
-  describe('set_loclist()', function()
-    it('sets diagnostics in lnum order', function()
-      local loc_list = exec_lua [[
-        vim.api.nvim_win_set_buf(0, diagnostic_bufnr)
+  describe('vim.lsp.diagnostic.on_refresh', function()
+    it('refreshes diagnostics on server-to-client request', function()
+      exec_lua(create_server_definition)
+      exec_lua(function()
+        _G.requests = 0
+        _G.server = _G._create_server({
+          capabilities = {
+            diagnosticProvider = {
+              documentSelector = vim.NIL,
+              interFileDependencies = false,
+              workspaceDiagnostics = false,
+            },
+          },
+          handlers = {
+            ['textDocument/diagnostic'] = function(_, _, callback)
+              _G.requests = _G.requests + 1
+              callback(nil, {
+                kind = 'full',
+                items = {
+                  _G.make_warning('Pull Diagnostic', 4, 4, 4, 4),
+                },
+              })
+            end,
+          },
+        })
+        client_id = assert(vim.lsp.start({ name = 'dummy', cmd = _G.server.cmd }))
+      end)
 
-        vim.lsp.diagnostic.on_publish_diagnostics(nil, nil, {
-            uri = fake_uri,
-            diagnostics = {
-              make_error('Farther Diagnostic', 4, 4, 4, 4),
-              make_error('Lower Diagnostic', 1, 1, 1, 1),
-            }
-          }, 1
-        )
+      local diags = exec_lua(function()
+        vim.lsp.diagnostic.on_diagnostic(nil, {
+          kind = 'full',
+          items = {
+            _G.make_error('Pull Diagnostic', 4, 4, 4, 4),
+          },
+        }, {
+          params = {
+            textDocument = { uri = fake_uri },
+          },
+          uri = fake_uri,
+          client_id = client_id,
+          bufnr = diagnostic_bufnr,
+        }, {})
 
-        vim.lsp.diagnostic.set_loclist()
+        return vim.diagnostic.get(diagnostic_bufnr)
+      end)
+      eq(1, #diags)
+      eq(1, diags[1].severity)
 
-        return vim.fn.getloclist(0)
-      ]]
+      local requests, refreshed_diags = exec_lua(function()
+        vim.lsp.diagnostic.on_refresh(nil, nil, {
+          method = 'workspace/diagnostic/refresh',
+          client_id = client_id,
+        })
 
-      assert(loc_list[1].lnum < loc_list[2].lnum)
+        return _G.requests, vim.diagnostic.get(diagnostic_bufnr)
+      end)
+      eq(2, requests)
+      eq(1, #refreshed_diags)
+      eq(2, refreshed_diags[1].severity)
     end)
 
-    it('sets diagnostics in lnum order, regardless of client', function()
-      local loc_list = exec_lua [[
-        vim.api.nvim_win_set_buf(0, diagnostic_bufnr)
+    it('refreshes workspace diagnostics', function()
+      local fake_uri_3 = 'file:///fake/uri3'
+      exec_lua(create_server_definition)
+      exec_lua(function()
+        _G.workspace_requests = 0
+        _G.doc_requests = 0
+        _G.server = _G._create_server({
+          capabilities = {
+            diagnosticProvider = {
+              documentSelector = vim.NIL,
+              interFileDependencies = false,
+              workspaceDiagnostics = true,
+            },
+          },
+          handlers = {
+            ['textDocument/diagnostic'] = function(_, _, callback)
+              _G.doc_requests = _G.doc_requests + 1
+              callback(nil, {
+                kind = 'full',
+                items = {
+                  _G.make_warning('Refreshed Diagnostic', 4, 4, 4, 4),
+                },
+              })
+            end,
+            ['workspace/diagnostic'] = function(_, _, callback)
+              _G.workspace_requests = _G.workspace_requests + 1
+              callback(nil, {
+                items = {
+                  {
+                    kind = 'full',
+                    uri = fake_uri_3,
+                    items = {
+                      _G.make_error('Workspace Diagnostic', 4, 4, 4, 4),
+                    },
+                  },
+                },
+              })
+            end,
+          },
+        })
+        client_id = assert(vim.lsp.start({ name = 'dummy', cmd = _G.server.cmd }))
+      end)
 
-        vim.lsp.diagnostic.on_publish_diagnostics(nil, nil, {
-            uri = fake_uri,
-            diagnostics = {
-              make_error('Lower Diagnostic', 1, 1, 1, 1),
-            }
-          }, 1
-        )
+      -- Seed the opened buffer with a document diagnostic so on_refresh must
+      -- re-request it even when workspace diagnostics are supported.
+      exec_lua(function()
+        vim.lsp.diagnostic.on_diagnostic(nil, {
+          kind = 'full',
+          items = {
+            _G.make_error('Initial Diagnostic', 4, 4, 4, 4),
+          },
+        }, {
+          params = {
+            textDocument = { uri = fake_uri },
+          },
+          uri = fake_uri,
+          client_id = client_id,
+          bufnr = diagnostic_bufnr,
+        }, {})
+      end)
 
-        vim.lsp.diagnostic.on_publish_diagnostics(nil, nil, {
-            uri = fake_uri,
-            diagnostics = {
-              make_warning('Farther Diagnostic', 4, 4, 4, 4),
-            }
-          }, 2
-        )
+      eq(
+        1,
+        exec_lua(function()
+          return #vim.diagnostic.get()
+        end)
+      )
 
-        vim.lsp.diagnostic.set_loclist()
+      eq(
+        { vim.NIL },
+        exec_lua(function()
+          local client = vim.lsp.get_client_by_id(client_id)
+          assert(client)
+          local result = {}
+          client:_provider_foreach('workspace/diagnostic', function(cap)
+            table.insert(result, cap.identifier or vim.NIL)
+          end)
+          return result
+        end)
+      )
 
-        return vim.fn.getloclist(0)
-      ]]
+      exec_lua(function()
+        _G.doc_requests = 0
+      end)
 
-      assert(loc_list[1].lnum < loc_list[2].lnum)
+      local workspace_requests, doc_requests, diags, opened_diags, workspace_diags = exec_lua(
+        function()
+          vim.lsp.diagnostic.on_refresh(nil, nil, {
+            method = 'workspace/diagnostic/refresh',
+            client_id = client_id,
+          })
+
+          return _G.workspace_requests,
+            _G.doc_requests,
+            vim.diagnostic.get(),
+            vim.diagnostic.get(diagnostic_bufnr),
+            vim.diagnostic.get(vim.uri.to_buf(fake_uri_3))
+        end
+      )
+      eq(1, workspace_requests)
+      eq(1, doc_requests)
+      eq(2, #diags)
+      eq(1, #opened_diags)
+      eq(2, opened_diags[1].severity)
+      eq(1, #workspace_diags)
+      eq(1, workspace_diags[1].severity)
     end)
   end)
 end)

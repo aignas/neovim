@@ -1,17 +1,19 @@
 -- Tests for 'fixeol'
 
-local helpers = require('test.functional.helpers')(after_each)
-local feed = helpers.feed
-local clear, feed_command, expect = helpers.clear, helpers.feed_command, helpers.expect
+local n = require('test.functional.testnvim')()
+local t = require('test.testutil')
+
+local describe, it, setup, teardown = t.describe, t.it, t.setup, t.teardown
+local feed = n.feed
+local clear, feed_command, expect = n.clear, n.feed_command, n.expect
 
 describe('fixeol', function()
   local function rmtestfiles()
-    feed_command('%bwipeout!')
-    feed_command('call delete("test.out")')
-    feed_command('call delete("XXEol")')
-    feed_command('call delete("XXNoEol")')
-    feed_command('call delete("XXTestEol")')
-    feed_command('call delete("XXTestNoEol")')
+    os.remove('test.out')
+    os.remove('XXEol')
+    os.remove('XXNoEol')
+    os.remove('XXTestEol')
+    os.remove('XXTestNoEol')
   end
   setup(function()
     clear()
@@ -23,8 +25,6 @@ describe('fixeol', function()
 
   it('is working', function()
     -- First write two test files – with and without trailing EOL.
-    -- Use Unix fileformat for consistency.
-    feed_command('set ff=unix')
     feed_command('enew!')
     feed('awith eol<esc>:w! XXEol<cr>')
     feed_command('enew!')
@@ -40,7 +40,7 @@ describe('fixeol', function()
     feed_command('e! XXNoEol')
     feed('ostays without<esc>:set nofixeol<cr>')
     feed_command('w! XXTestNoEol')
-    feed_command('bwipe XXEol XXNoEol XXTestEol XXTestNoEol')
+    feed_command('bwipe! XXEol XXNoEol XXTestEol XXTestNoEol')
     feed_command('set fixeol')
 
     -- Append "END" to each file so that we can see what the last written char was.

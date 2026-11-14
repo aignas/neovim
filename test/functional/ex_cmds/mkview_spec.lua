@@ -1,12 +1,14 @@
-local lfs = require('lfs')
-local helpers = require('test.functional.helpers')(after_each)
+local t = require('test.testutil')
+local n = require('test.functional.testnvim')()
 
-local clear = helpers.clear
-local command = helpers.command
-local get_pathsep = helpers.get_pathsep
-local eq = helpers.eq
-local funcs = helpers.funcs
-local rmdir = helpers.rmdir
+local describe, it, before_each, after_each = t.describe, t.it, t.before_each, t.after_each
+local clear = n.clear
+local command = n.command
+local get_pathsep = n.get_pathsep
+local eq = t.eq
+local fn = n.fn
+local rmdir = n.rmdir
+local mkdir = t.mkdir
 
 local file_prefix = 'Xtest-functional-ex_cmds-mkview_spec'
 
@@ -17,8 +19,8 @@ describe(':mkview', function()
 
   before_each(function()
     clear()
-    lfs.mkdir(view_dir)
-    lfs.mkdir(local_dir)
+    mkdir(view_dir)
+    mkdir(local_dir)
   end)
 
   after_each(function()
@@ -28,9 +30,8 @@ describe(':mkview', function()
   end)
 
   it('viewoption curdir restores local current directory', function()
-    local cwd_dir = funcs.getcwd()
-    local set_view_dir_command = 'set viewdir=' .. cwd_dir ..
-          get_pathsep() .. view_dir
+    local cwd_dir = fn.getcwd()
+    local set_view_dir_command = 'set viewdir=' .. cwd_dir .. get_pathsep() .. view_dir
 
     -- By default the local current directory should save
     command(set_view_dir_command)
@@ -56,12 +57,11 @@ describe(':mkview', function()
     command('edit ' .. tmp_file_base .. '2')
     command('loadview')
     -- The view's current directory should not have changed
-    eq(cwd_dir, funcs.getcwd())
+    eq(cwd_dir, fn.getcwd())
     -- Load the view with a saved local current directory
     command('edit ' .. tmp_file_base .. '1')
     command('loadview')
     -- The view's local directory should have been saved
-    eq(cwd_dir .. get_pathsep() .. local_dir, funcs.getcwd())
+    eq(cwd_dir .. get_pathsep() .. local_dir, fn.getcwd())
   end)
-
 end)

@@ -12,26 +12,34 @@
 -- Use a FileChangedShell autocommand to avoid a prompt for "Xtestfile.gz"
 -- being modified outside of Vim (noticed on Solaris).
 
-local helpers= require('test.functional.helpers')(after_each)
-local lfs = require('lfs')
+local t = require('test.testutil')
+local n = require('test.functional.testnvim')()
+
+local describe, it, before_each, setup, teardown, pending =
+  t.describe, t.it, t.before_each, t.setup, t.teardown, t.pending
 local clear, feed_command, expect, eq, neq, dedent, write_file, feed =
-  helpers.clear, helpers.feed_command, helpers.expect, helpers.eq, helpers.neq,
-  helpers.dedent, helpers.write_file, helpers.feed
-local iswin = helpers.iswin
-local read_file = helpers.read_file
+  n.clear, n.feed_command, n.expect, t.eq, t.neq, t.dedent, t.write_file, n.feed
+local command = n.command
+local read_file = t.read_file
+local is_os = t.is_os
 
 local function has_gzip()
-  local null = iswin() and 'nul' or '/dev/null'
+  local null = is_os('win') and 'nul' or '/dev/null'
   return os.execute('gzip --help >' .. null .. ' 2>&1') == 0
 end
 
 local function prepare_gz_file(name, text)
-  write_file(name, text..'\n')
+  write_file(name, text .. '\n')
   -- Compress the file with gzip.
-  os.execute('gzip --force '..name)
+  command([[call system(['gzip', '--force', ']] .. name .. [['])]])
   -- This should create the .gz file and delete the original.
-  neq(nil, lfs.attributes(name..'.gz'))
-  eq(nil, lfs.attributes(name))
+  neq(nil, vim.uv.fs_stat(name .. '.gz'))
+  eq(nil, vim.uv.fs_stat(name))
+end
+
+local function prepare_file(name, text)
+  os.remove(name)
+  write_file(name, text)
 end
 
 describe('file reading, writing and bufnew and filter autocommands', function()
@@ -48,38 +56,44 @@ describe('file reading, writing and bufnew and filter autocommands', function()
       line 10 Abcdefghijklmnopqrstuvwxyz
       end of testfile]])
   setup(function()
-    write_file('Xtest.c', [[
+    write_file(
+      'Xtest.c',
+      [[
       /*
        * Here is a new .c file
        */
-      ]])
+      ]]
+    )
   end)
-  before_each(clear)
+  before_each(function()
+    clear({ env = { GZIP = nil } })
+  end)
   teardown(function()
     os.remove('Xtestfile.gz')
+    os.remove('Xtestfile')
+    os.remove('XtestfileByFileReadPost')
     os.remove('Xtest.c')
     os.remove('test.out')
+  end)
+
+  it('FileReadPost', function()
+    feed_command('set bin')
+    prepare_file('Xtestfile', text1)
+    os.remove('XtestfileByFileReadPost')
+    --execute('au FileChangedShell * echo "caught FileChangedShell"')
+    feed_command("au FileReadPost    Xtestfile   '[,']w XtestfileByFileReadPost")
+    -- Read the testfile.
+    feed_command('$r Xtestfile')
+    expect('\n' .. text1)
+    eq(text1, read_file('XtestfileByFileReadPost'))
   end)
 
   if not has_gzip() then
     pending('skipped (missing `gzip` utility)', function() end)
   else
-
-    it('FileReadPost (using gzip)', function()
-      prepare_gz_file('Xtestfile', text1)
-      feed_command('let $GZIP = ""')
-      --execute('au FileChangedShell * echo "caught FileChangedShell"')
-      feed_command('set bin')
-      feed_command("au FileReadPost    *.gz   '[,']!gzip -d")
-      -- Read and decompress the testfile.
-      feed_command('$r Xtestfile.gz')
-      expect('\n'..text1)
-    end)
-
     it('BufReadPre, BufReadPost (using gzip)', function()
       prepare_gz_file('Xtestfile', text1)
       local gzip_data = read_file('Xtestfile.gz')
-      feed_command('let $GZIP = ""')
       -- Setup autocommands to decompress before reading and re-compress afterwards.
       feed_command("au BufReadPre   *.gz  exe '!gzip -d ' . shellescape(expand('<afile>'))")
       feed_command("au BufReadPre   *.gz  call rename(expand('<afile>:r'), expand('<afile>'))")
@@ -99,7 +113,9 @@ describe('file reading, writing and bufnew and filter autocommands', function()
     -- luacheck: ignore 611 (Line contains only whitespaces)
     it('FileReadPre, FileReadPost', function()
       prepare_gz_file('Xtestfile', text1)
-      feed_command('au! FileReadPre    *.gz   exe "silent !gzip -d " . shellescape(expand("<afile>"))')
+      feed_command(
+        'au! FileReadPre    *.gz   exe "silent !gzip -d " . shellescape(expand("<afile>"))'
+      )
       feed_command('au  FileReadPre    *.gz   call rename(expand("<afile>:r"), expand("<afile>"))')
       feed_command("au! FileReadPost   *.gz   '[,']s/l/L/")
       -- Read compressed file.
@@ -107,20 +123,19 @@ describe('file reading, writing and bufnew and filter autocommands', function()
       -- Discard all prompts and messages.
       feed('<C-L>')
       expect([[
-	
-	start of testfiLe
-	Line 2	Abcdefghijklmnopqrstuvwxyz
-	Line 3	xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-	Line 4	Abcdefghijklmnopqrstuvwxyz
-	Line 5	xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-	Line 6	Abcdefghijklmnopqrstuvwxyz
-	Line 7	xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-	Line 8	Abcdefghijklmnopqrstuvwxyz
-	Line 9	xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-	Line 10 Abcdefghijklmnopqrstuvwxyz
-	end of testfiLe]])
+        
+        start of testfiLe
+        Line 2	Abcdefghijklmnopqrstuvwxyz
+        Line 3	xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        Line 4	Abcdefghijklmnopqrstuvwxyz
+        Line 5	xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        Line 6	Abcdefghijklmnopqrstuvwxyz
+        Line 7	xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        Line 8	Abcdefghijklmnopqrstuvwxyz
+        Line 9	xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        Line 10 Abcdefghijklmnopqrstuvwxyz
+        end of testfiLe]])
     end)
-
   end
 
   it('FileAppendPre, FileAppendPost', function()
@@ -128,13 +143,11 @@ describe('file reading, writing and bufnew and filter autocommands', function()
     -- Will load Xtest.c.
     feed_command('e! foo.c')
     feed_command("au FileAppendPre   *.out  '[,']s/new/NEW/")
-    feed_command('au FileAppendPost  *.out  !cat Xtest.c >>test.out')
+    feed_command('au FileAppendPost  *.out  !cat Xtest.c >test.out')
     -- Append it to the output file.
     feed_command('w>>test.out')
     -- Discard all prompts and messages.
     feed('<C-L>')
-    -- Expect the decompressed file in the buffer.
-    feed_command('e test.out')
     expect([[
       
       /*
@@ -170,9 +183,15 @@ describe('file reading, writing and bufnew and filter autocommands', function()
        */]]))
     -- Need temp files here.
     feed_command('set shelltemp')
-    feed_command('au FilterReadPre   *.out  call rename(expand("<afile>"), expand("<afile>") . ".t")')
-    feed_command('au FilterReadPre   *.out  exe "silent !sed s/e/E/ " . shellescape(expand("<afile>")) . ".t >" . shellescape(expand("<afile>"))')
-    feed_command('au FilterReadPre   *.out  exe "silent !rm " . shellescape(expand("<afile>")) . ".t"')
+    feed_command(
+      'au FilterReadPre   *.out  call rename(expand("<afile>"), expand("<afile>") . ".t")'
+    )
+    feed_command(
+      'au FilterReadPre   *.out  exe "silent !sed s/e/E/ " . shellescape(expand("<afile>")) . ".t >" . shellescape(expand("<afile>"))'
+    )
+    feed_command(
+      'au FilterReadPre   *.out  exe "silent !rm " . shellescape(expand("<afile>")) . ".t"'
+    )
     feed_command("au FilterReadPost  *.out  '[,']s/x/X/g")
     -- Edit the output file.
     feed_command('e! test.out')

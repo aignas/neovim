@@ -1,27 +1,30 @@
-local helpers = require('test.functional.helpers')(after_each)
-local clear = helpers.clear
-local command = helpers.command
-local eq = helpers.eq
-local eval = helpers.eval
-local feed = helpers.feed
-local nvim = helpers.nvim
-local nvim_dir = helpers.nvim_dir
-local retry = helpers.retry
+local t = require('test.testutil')
+local n = require('test.functional.testnvim')()
+
+local describe, it, before_each = t.describe, t.it, t.before_each
+local clear = n.clear
+local command = n.command
+local eq = t.eq
+local eval = n.eval
+local feed = n.feed
+local api = n.api
+local testprg = n.testprg
+local retry = t.retry
 
 describe(':ls', function()
   before_each(function()
     clear()
   end)
 
-  it('R, F for :terminal buffers', function()
-    nvim('set_option', 'shell', string.format('"%s" INTERACT', nvim_dir..'/shell-test'))
-
+  --- @param start_running_term fun()
+  --- @param start_finished_term fun()
+  local function test_ls_terminal_buffer(start_running_term, start_finished_term)
     command('edit foo')
     command('set hidden')
-    command('terminal')
+    start_running_term()
     command('vsplit')
-    command('terminal')
-    feed('iexit<cr>')
+    start_finished_term()
+
     retry(nil, 5000, function()
       local ls_output = eval('execute("ls")')
       -- Normal buffer.
@@ -43,7 +46,25 @@ describe(':ls', function()
       -- Just the [F]inished terminal buffer.
       eq('\n  3 %aF ', string.match(ls_output, '^\n *3 ... '))
     end)
+  end
+
+  describe('R, F for', function()
+    it('terminal buffers', function()
+      api.nvim_set_option_value('shell', string.format('"%s" INTERACT', testprg('shell-test')), {})
+      test_ls_terminal_buffer(function()
+        command('terminal')
+      end, function()
+        command('terminal')
+        feed('iexit<cr>')
+      end)
+    end)
+
+    it('nvim_open_term() buffers', function()
+      test_ls_terminal_buffer(function()
+        command('enew | call nvim_open_term(0, {})')
+      end, function()
+        command('enew | call chanclose(nvim_open_term(0, {}))')
+      end)
+    end)
   end)
-
 end)
-

@@ -1,56 +1,47 @@
-// This is an open source non-commercial project. Dear PVS-Studio, please check
-// it. PVS-Studio Static Code Analyzer for C, C++ and C#: http://www.viva64.com
-
 #include <assert.h>
-#include <inttypes.h>
+#include <limits.h>
+#include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "nvim/api/private/helpers.h"
+#include "klib/kvec.h"
+#include "nvim/api/private/converter.h"
 #include "nvim/api/private/defs.h"
-#include "nvim/api/private/handle.h"
-#include "nvim/api/vim.h"
-#include "nvim/msgpack_rpc/helpers.h"
+#include "nvim/api/private/helpers.h"
+#include "nvim/api/private/validate.h"
+#include "nvim/ascii_defs.h"
+#include "nvim/buffer_defs.h"
+#include "nvim/eval/typval.h"
+#include "nvim/eval/vars.h"
+#include "nvim/ex_eval.h"
+#include "nvim/garray_defs.h"
+#include "nvim/globals.h"
+#include "nvim/highlight_group.h"
 #include "nvim/lua/executor.h"
-#include "nvim/ascii.h"
-#include "nvim/assert.h"
-#include "nvim/charset.h"
-#include "nvim/syntax.h"
-#include "nvim/vim.h"
-#include "nvim/buffer.h"
-#include "nvim/window.h"
+#include "nvim/map_defs.h"
+#include "nvim/mark.h"
 #include "nvim/memline.h"
 #include "nvim/memory.h"
-#include "nvim/eval.h"
-#include "nvim/eval/typval.h"
-#include "nvim/map_defs.h"
-#include "nvim/map.h"
-#include "nvim/extmark.h"
-#include "nvim/decoration.h"
-#include "nvim/option.h"
-#include "nvim/option_defs.h"
-#include "nvim/version.h"
-#include "nvim/lib/kvec.h"
-#include "nvim/getchar.h"
-#include "nvim/fileio.h"
-#include "nvim/ui.h"
+#include "nvim/memory_defs.h"
+#include "nvim/message.h"
+#include "nvim/msgpack_rpc/unpacker.h"
+#include "nvim/pos_defs.h"
+#include "nvim/runtime.h"
+#include "nvim/types_defs.h"
 
-/// Helper structure for vim_to_object
-typedef struct {
-  kvec_t(Object) stack;  ///< Object stack.
-} EncodedData;
+#include "api/private/api_metadata.generated.h"
+#include "api/private/helpers.c.generated.h"  // IWYU pragma: keep
 
-#ifdef INCLUDE_GENERATED_DECLARATIONS
-# include "api/private/helpers.c.generated.h"
-# include "api/private/funcs_metadata.generated.h"
-# include "api/private/ui_events_metadata.generated.h"
-#endif
-
-/// Start block that may cause VimL exceptions while evaluating another code
+/// Start block that may cause Vimscript exceptions while evaluating another code
 ///
-/// Used when caller is supposed to be operating when other VimL code is being
-/// processed and that “other VimL code” must not be affected.
+/// Used just in case caller is supposed to be operating when other Vimscript code
+/// is being processed and that “other Vimscript code” must not be affected.
+///
+/// @warning Avoid calling directly; use TRY_WRAP instead.
 ///
 /// @param[out]  tstate  Location where try state should be saved.
 void try_enter(TryState *const tstate)
@@ -60,72 +51,35 @@ void try_enter(TryState *const tstate)
   //              save_dbg_stuff()/restore_dbg_stuff().
   *tstate = (TryState) {
     .current_exception = current_exception,
-    .msg_list = (const struct msglist *const *)msg_list,
+    .msg_list = (const msglist_T *const *)msg_list,
     .private_msg_list = NULL,
-    .trylevel = trylevel,
     .got_int = got_int,
+    .did_throw = did_throw,
     .need_rethrow = need_rethrow,
     .did_emsg = did_emsg,
   };
+  // `msg_list` controls the collection of abort-causing non-exception errors,
+  // which would otherwise be ignored.  This pattern is from do_cmdline().
   msg_list = &tstate->private_msg_list;
   current_exception = NULL;
-  trylevel = 1;
   got_int = false;
+  did_throw = false;
   need_rethrow = false;
   did_emsg = false;
+  trylevel++;
 }
 
-/// End try block, set the error message if any and restore previous state
+/// Ends a `try_enter` block; sets error message if any.
 ///
-/// @warning Return is consistent with most functions (false on error), not with
-///          try_end (true on error).
+/// @warning Avoid calling directly; use TRY_WRAP instead.
 ///
-/// @param[in]  tstate  Previous state to restore.
-/// @param[out]  err  Location where error should be saved.
-///
-/// @return false if error occurred, true otherwise.
-bool try_leave(const TryState *const tstate, Error *const err)
-  FUNC_ATTR_NONNULL_ALL FUNC_ATTR_WARN_UNUSED_RESULT
-{
-  const bool ret = !try_end(err);
-  assert(trylevel == 0);
-  assert(!need_rethrow);
-  assert(!got_int);
-  assert(!did_emsg);
-  assert(msg_list == &tstate->private_msg_list);
-  assert(*msg_list == NULL);
-  assert(current_exception == NULL);
-  msg_list = (struct msglist **)tstate->msg_list;
-  current_exception = tstate->current_exception;
-  trylevel = tstate->trylevel;
-  got_int = tstate->got_int;
-  need_rethrow = tstate->need_rethrow;
-  did_emsg = tstate->did_emsg;
-  return ret;
-}
-
-/// Start block that may cause vimscript exceptions
-///
-/// Each try_start() call should be mirrored by try_end() call.
-///
-/// To be used as a replacement of `:try … catch … endtry` in C code, in cases
-/// when error flag could not already be set. If there may be pending error
-/// state at the time try_start() is executed which needs to be preserved,
-/// try_enter()/try_leave() pair should be used instead.
-void try_start(void)
-{
-  ++trylevel;
-}
-
-/// End try block, set the error message if any and return true if an error
-/// occurred.
-///
-/// @param err Pointer to the stack-allocated error object
-/// @return true if an error occurred
-bool try_end(Error *err)
+/// @param[out] err Pointer to the stack-allocated error object
+void try_leave(const TryState *const tstate, Error *const err)
+  FUNC_ATTR_NONNULL_ALL
 {
   // Note: all globals manipulated here should be saved/restored in
   // try_enter/try_leave.
+  assert(trylevel > 0);
   trylevel--;
 
   // Set by emsg(), affects aborting().  See also enter_cleanup().
@@ -133,7 +87,7 @@ bool try_end(Error *err)
   force_abort = false;
 
   if (got_int) {
-    if (current_exception) {
+    if (did_throw) {
       // If we got an interrupt, discard the current exception
       discard_current_exception();
     }
@@ -141,23 +95,40 @@ bool try_end(Error *err)
     api_set_error(err, kErrorTypeException, "Keyboard interrupt");
     got_int = false;
   } else if (msg_list != NULL && *msg_list != NULL) {
-    int should_free;
-    char *msg = (char *)get_exception_string(*msg_list,
-                                             ET_ERROR,
-                                             NULL,
-                                             &should_free);
+    bool should_free;
+    char *msg = get_exception_string(*msg_list,
+                                     ET_ERROR,
+                                     NULL,
+                                     &should_free);
     api_set_error(err, kErrorTypeException, "%s", msg);
     free_global_msglist();
 
     if (should_free) {
       xfree(msg);
     }
-  } else if (current_exception) {
-    api_set_error(err, kErrorTypeException, "%s", current_exception->value);
+  } else if (did_throw || need_rethrow) {
+    if (*current_exception->throw_name != NUL) {
+      if (current_exception->throw_lnum != 0) {
+        api_set_error(err, kErrorTypeException, "%s, line %" PRIdLINENR ": %s",
+                      current_exception->throw_name, current_exception->throw_lnum,
+                      current_exception->value);
+      } else {
+        api_set_error(err, kErrorTypeException, "%s: %s",
+                      current_exception->throw_name, current_exception->value);
+      }
+    } else {
+      api_set_error(err, kErrorTypeException, "%s", current_exception->value);
+    }
     discard_current_exception();
   }
 
-  return ERROR_SET(err);
+  // Restore the exception context.
+  msg_list = (msglist_T **)tstate->msg_list;
+  current_exception = tstate->current_exception;
+  got_int = tstate->got_int;
+  did_throw = tstate->did_throw;
+  need_rethrow = tstate->need_rethrow;
+  did_emsg = tstate->did_emsg;
 }
 
 /// Recursively expands a vimscript value in a dict
@@ -165,16 +136,38 @@ bool try_end(Error *err)
 /// @param dict The vimscript dict
 /// @param key The key
 /// @param[out] err Details of an error that may have occurred
-Object dict_get_value(dict_T *dict, String key, Error *err)
+Object dict_get_value(dict_T *dict, String key, Arena *arena, Error *err)
 {
   dictitem_T *const di = tv_dict_find(dict, key.data, (ptrdiff_t)key.size);
 
-  if (di == NULL) {
-    api_set_error(err, kErrorTypeValidation, "Key not found: %s", key.data);
+  VALIDATE(di != NULL, "Key not found: %s", key.data, {
     return (Object)OBJECT_INIT;
+  });
+
+  return vim_to_object(&di->di_tv, arena, true);
+}
+
+dictitem_T *dict_check_writable(dict_T *dict, String key, bool del, Error *err)
+{
+  dictitem_T *di = tv_dict_find(dict, key.data, (ptrdiff_t)key.size);
+
+  if (di != NULL) {
+    if (di->di_flags & DI_FLAGS_RO) {
+      api_set_error(err, kErrorTypeException, "Key is read-only: %s", key.data);
+    } else if (di->di_flags & DI_FLAGS_LOCK) {
+      api_set_error(err, kErrorTypeException, "Key is locked: %s", key.data);
+    } else if (del && (di->di_flags & DI_FLAGS_FIX)) {
+      api_set_error(err, kErrorTypeException, "Key is fixed: %s", key.data);
+    }
+  } else if (dict->dv_lock) {
+    api_set_error(err, kErrorTypeException, "Dict is locked");
+  } else if (key.size == 0) {
+    api_set_error(err, kErrorTypeValidation, "Key name is empty");
+  } else if (key.size > INT_MAX) {
+    api_set_error(err, kErrorTypeValidation, "Key name is too long");
   }
 
-  return vim_to_object(&di->di_tv);
+  return di;
 }
 
 /// Set a value in a scope dict. Objects are recursively expanded into their
@@ -188,44 +181,31 @@ Object dict_get_value(dict_T *dict, String key, Error *err)
 /// @param retval If true the old value will be converted and returned.
 /// @param[out] err Details of an error that may have occurred
 /// @return The old value if `retval` is true and the key was present, else NIL
-Object dict_set_var(dict_T *dict, String key, Object value, bool del,
-                    bool retval, Error *err)
+Object dict_set_var(dict_T *dict, String key, Object value, bool del, bool retval, Arena *arena,
+                    Error *err)
 {
   Object rv = OBJECT_INIT;
-  dictitem_T *di = tv_dict_find(dict, key.data, (ptrdiff_t)key.size);
+  dictitem_T *di = dict_check_writable(dict, key, del, err);
 
-  if (di != NULL) {
-    if (di->di_flags & DI_FLAGS_RO) {
-      api_set_error(err, kErrorTypeException, "Key is read-only: %s", key.data);
-      return rv;
-    } else if (di->di_flags & DI_FLAGS_LOCK) {
-      api_set_error(err, kErrorTypeException, "Key is locked: %s", key.data);
-      return rv;
-    } else if (del && (di->di_flags & DI_FLAGS_FIX)) {
-      api_set_error(err, kErrorTypeException, "Key is fixed: %s", key.data);
-      return rv;
-    }
-  } else if (dict->dv_lock) {
-    api_set_error(err, kErrorTypeException, "Dictionary is locked");
-    return rv;
-  } else if (key.size == 0) {
-    api_set_error(err, kErrorTypeValidation, "Key name is empty");
-    return rv;
-  } else if (key.size > INT_MAX) {
-    api_set_error(err, kErrorTypeValidation, "Key name is too long");
+  if (ERROR_SET(err)) {
     return rv;
   }
+
+  bool watched = tv_dict_is_watched(dict);
 
   if (del) {
     // Delete the key
     if (di == NULL) {
       // Doesn't exist, fail
-      api_set_error(err, kErrorTypeValidation, "Key not found: %s",
-                    key.data);
+      api_set_error(err, kErrorTypeValidation, "Key not found: %s", key.data);
     } else {
+      // Notify watchers
+      if (watched) {
+        tv_dict_watcher_notify(dict, key.data, NULL, &di->di_tv);
+      }
       // Return the old value
       if (retval) {
-        rv = vim_to_object(&di->di_tv);
+        rv = vim_to_object(&di->di_tv, arena, false);
       }
       // Delete the entry
       tv_dict_item_remove(dict, di);
@@ -235,9 +215,9 @@ Object dict_set_var(dict_T *dict, String key, Object value, bool del,
     typval_T tv;
 
     // Convert the object to a vimscript type in the temporary variable
-    if (!object_to_vim(value, &tv, err)) {
-      return rv;
-    }
+    object_to_vim(value, &tv, err);
+
+    typval_T oldtv = TV_INITIAL_VALUE;
 
     if (di == NULL) {
       // Need to create an entry
@@ -246,383 +226,38 @@ Object dict_set_var(dict_T *dict, String key, Object value, bool del,
     } else {
       // Return the old value
       if (retval) {
-        rv = vim_to_object(&di->di_tv);
+        rv = vim_to_object(&di->di_tv, arena, false);
+      }
+      bool type_error = false;
+      if (dict == get_vimvar_dict()
+          && !before_set_vvar(key.data, di, &tv, true, watched, &type_error)) {
+        tv_clear(&tv);
+        if (type_error) {
+          api_set_error(err, kErrorTypeValidation,
+                        "Setting v:%s to value with wrong type", key.data);
+        }
+        return rv;
+      }
+      if (watched) {
+        tv_copy(&di->di_tv, &oldtv);
       }
       tv_clear(&di->di_tv);
     }
 
     // Update the value
     tv_copy(&tv, &di->di_tv);
+
+    // Notify watchers
+    if (watched) {
+      tv_dict_watcher_notify(dict, key.data, &tv, &oldtv);
+      tv_clear(&oldtv);
+    }
+
     // Clear the temporary variable
     tv_clear(&tv);
   }
 
   return rv;
-}
-
-/// Gets the value of a global or local(buffer, window) option.
-///
-/// @param from If `type` is `SREQ_WIN` or `SREQ_BUF`, this must be a pointer
-///        to the window or buffer.
-/// @param type One of `SREQ_GLOBAL`, `SREQ_WIN` or `SREQ_BUF`
-/// @param name The option name
-/// @param[out] err Details of an error that may have occurred
-/// @return the option value
-Object get_option_from(void *from, int type, String name, Error *err)
-{
-  Object rv = OBJECT_INIT;
-
-  if (name.size == 0) {
-    api_set_error(err, kErrorTypeValidation, "Empty option name");
-    return rv;
-  }
-
-  // Return values
-  int64_t numval;
-  char *stringval = NULL;
-  int flags = get_option_value_strict(name.data, &numval, &stringval,
-                                      type, from);
-
-  if (!flags) {
-    api_set_error(err, kErrorTypeValidation, "Invalid option name: '%s'",
-                  name.data);
-    return rv;
-  }
-
-  if (flags & SOPT_BOOL) {
-    rv.type = kObjectTypeBoolean;
-    rv.data.boolean = numval ? true : false;
-  } else if (flags & SOPT_NUM) {
-    rv.type = kObjectTypeInteger;
-    rv.data.integer = numval;
-  } else if (flags & SOPT_STRING) {
-    if (stringval) {
-      rv.type = kObjectTypeString;
-      rv.data.string.data = stringval;
-      rv.data.string.size = strlen(stringval);
-    } else {
-      api_set_error(err, kErrorTypeException,
-                    "Failed to get value for option '%s'",
-                    name.data);
-    }
-  } else {
-    api_set_error(err,
-                  kErrorTypeException,
-                  "Unknown type for option '%s'",
-                  name.data);
-  }
-
-  return rv;
-}
-
-/// Sets the value of a global or local(buffer, window) option.
-///
-/// @param to If `type` is `SREQ_WIN` or `SREQ_BUF`, this must be a pointer
-///        to the window or buffer.
-/// @param type One of `SREQ_GLOBAL`, `SREQ_WIN` or `SREQ_BUF`
-/// @param name The option name
-/// @param[out] err Details of an error that may have occurred
-void set_option_to(uint64_t channel_id, void *to, int type,
-                   String name, Object value, Error *err)
-{
-  if (name.size == 0) {
-    api_set_error(err, kErrorTypeValidation, "Empty option name");
-    return;
-  }
-
-  int flags = get_option_value_strict(name.data, NULL, NULL, type, to);
-
-  if (flags == 0) {
-    api_set_error(err, kErrorTypeValidation, "Invalid option name '%s'",
-                  name.data);
-    return;
-  }
-
-  if (value.type == kObjectTypeNil) {
-    if (type == SREQ_GLOBAL) {
-      api_set_error(err, kErrorTypeException, "Cannot unset option '%s'",
-                    name.data);
-      return;
-    } else if (!(flags & SOPT_GLOBAL)) {
-      api_set_error(err,
-                    kErrorTypeException,
-                    "Cannot unset option '%s' "
-                    "because it doesn't have a global value",
-                    name.data);
-      return;
-    } else {
-      unset_global_local_option(name.data, to);
-      return;
-    }
-  }
-
-  int numval = 0;
-  char *stringval = NULL;
-
-  if (flags & SOPT_BOOL) {
-    if (value.type != kObjectTypeBoolean) {
-      api_set_error(err,
-                    kErrorTypeValidation,
-                    "Option '%s' requires a Boolean value",
-                    name.data);
-      return;
-    }
-
-    numval = value.data.boolean;
-  } else if (flags & SOPT_NUM) {
-    if (value.type != kObjectTypeInteger) {
-      api_set_error(err, kErrorTypeValidation,
-                    "Option '%s' requires an integer value",
-                    name.data);
-      return;
-    }
-
-    if (value.data.integer > INT_MAX || value.data.integer < INT_MIN) {
-      api_set_error(err, kErrorTypeValidation,
-                    "Value for option '%s' is out of range",
-                    name.data);
-      return;
-    }
-
-    numval = (int)value.data.integer;
-  } else {
-    if (value.type != kObjectTypeString) {
-      api_set_error(err, kErrorTypeValidation,
-                    "Option '%s' requires a string value",
-                    name.data);
-      return;
-    }
-
-    stringval = (char *)value.data.string.data;
-  }
-
-  const sctx_T save_current_sctx = current_sctx;
-  current_sctx.sc_sid =
-    channel_id == LUA_INTERNAL_CALL ? SID_LUA : SID_API_CLIENT;
-  current_sctx.sc_lnum = 0;
-  current_channel_id = channel_id;
-
-  const int opt_flags = (type == SREQ_WIN && !(flags & SOPT_GLOBAL))
-                        ? 0 : (type == SREQ_GLOBAL)
-                              ? OPT_GLOBAL : OPT_LOCAL;
-  set_option_value_for(name.data, numval, stringval,
-                       opt_flags, type, to, err);
-
-  current_sctx = save_current_sctx;
-}
-
-#define TYPVAL_ENCODE_ALLOW_SPECIALS false
-
-#define TYPVAL_ENCODE_CONV_NIL(tv) \
-    kv_push(edata->stack, NIL)
-
-#define TYPVAL_ENCODE_CONV_BOOL(tv, num) \
-    kv_push(edata->stack, BOOLEAN_OBJ((Boolean)(num)))
-
-#define TYPVAL_ENCODE_CONV_NUMBER(tv, num) \
-    kv_push(edata->stack, INTEGER_OBJ((Integer)(num)))
-
-#define TYPVAL_ENCODE_CONV_UNSIGNED_NUMBER TYPVAL_ENCODE_CONV_NUMBER
-
-#define TYPVAL_ENCODE_CONV_FLOAT(tv, flt) \
-    kv_push(edata->stack, FLOAT_OBJ((Float)(flt)))
-
-#define TYPVAL_ENCODE_CONV_STRING(tv, str, len) \
-    do { \
-      const size_t len_ = (size_t)(len); \
-      const char *const str_ = (const char *)(str); \
-      assert(len_ == 0 || str_ != NULL); \
-      kv_push(edata->stack, STRING_OBJ(((String) { \
-        .data = xmemdupz((len_?str_:""), len_), \
-        .size = len_ \
-      }))); \
-    } while (0)
-
-#define TYPVAL_ENCODE_CONV_STR_STRING TYPVAL_ENCODE_CONV_STRING
-
-#define TYPVAL_ENCODE_CONV_EXT_STRING(tv, str, len, type) \
-    TYPVAL_ENCODE_CONV_NIL(tv)
-
-#define TYPVAL_ENCODE_CONV_FUNC_START(tv, fun) \
-    do { \
-      TYPVAL_ENCODE_CONV_NIL(tv); \
-      goto typval_encode_stop_converting_one_item; \
-    } while (0)
-
-#define TYPVAL_ENCODE_CONV_FUNC_BEFORE_ARGS(tv, len)
-#define TYPVAL_ENCODE_CONV_FUNC_BEFORE_SELF(tv, len)
-#define TYPVAL_ENCODE_CONV_FUNC_END(tv)
-
-#define TYPVAL_ENCODE_CONV_EMPTY_LIST(tv) \
-    kv_push(edata->stack, ARRAY_OBJ(((Array) { .capacity = 0, .size = 0 })))
-
-#define TYPVAL_ENCODE_CONV_EMPTY_DICT(tv, dict) \
-    kv_push(edata->stack, \
-            DICTIONARY_OBJ(((Dictionary) { .capacity = 0, .size = 0 })))
-
-static inline void typval_encode_list_start(EncodedData *const edata,
-                                            const size_t len)
-  FUNC_ATTR_ALWAYS_INLINE FUNC_ATTR_NONNULL_ALL
-{
-  kv_push(edata->stack, ARRAY_OBJ(((Array) {
-    .capacity = len,
-    .size = 0,
-    .items = xmalloc(len * sizeof(*((Object)OBJECT_INIT).data.array.items)),
-  })));
-}
-
-#define TYPVAL_ENCODE_CONV_LIST_START(tv, len) \
-    typval_encode_list_start(edata, (size_t)(len))
-
-#define TYPVAL_ENCODE_CONV_REAL_LIST_AFTER_START(tv, mpsv)
-
-static inline void typval_encode_between_list_items(EncodedData *const edata)
-  FUNC_ATTR_ALWAYS_INLINE FUNC_ATTR_NONNULL_ALL
-{
-  Object item = kv_pop(edata->stack);
-  Object *const list = &kv_last(edata->stack);
-  assert(list->type == kObjectTypeArray);
-  assert(list->data.array.size < list->data.array.capacity);
-  list->data.array.items[list->data.array.size++] = item;
-}
-
-#define TYPVAL_ENCODE_CONV_LIST_BETWEEN_ITEMS(tv) \
-    typval_encode_between_list_items(edata)
-
-static inline void typval_encode_list_end(EncodedData *const edata)
-  FUNC_ATTR_ALWAYS_INLINE FUNC_ATTR_NONNULL_ALL
-{
-  typval_encode_between_list_items(edata);
-#ifndef NDEBUG
-  const Object *const list = &kv_last(edata->stack);
-  assert(list->data.array.size == list->data.array.capacity);
-#endif
-}
-
-#define TYPVAL_ENCODE_CONV_LIST_END(tv) \
-    typval_encode_list_end(edata)
-
-static inline void typval_encode_dict_start(EncodedData *const edata,
-                                            const size_t len)
-  FUNC_ATTR_ALWAYS_INLINE FUNC_ATTR_NONNULL_ALL
-{
-  kv_push(edata->stack, DICTIONARY_OBJ(((Dictionary) {
-    .capacity = len,
-    .size = 0,
-    .items = xmalloc(len * sizeof(
-        *((Object)OBJECT_INIT).data.dictionary.items)),
-  })));
-}
-
-#define TYPVAL_ENCODE_CONV_DICT_START(tv, dict, len) \
-    typval_encode_dict_start(edata, (size_t)(len))
-
-#define TYPVAL_ENCODE_CONV_REAL_DICT_AFTER_START(tv, dict, mpsv)
-
-#define TYPVAL_ENCODE_SPECIAL_DICT_KEY_CHECK(label, kv_pair)
-
-static inline void typval_encode_after_key(EncodedData *const edata)
-  FUNC_ATTR_ALWAYS_INLINE FUNC_ATTR_NONNULL_ALL
-{
-  Object key = kv_pop(edata->stack);
-  Object *const dict = &kv_last(edata->stack);
-  assert(dict->type == kObjectTypeDictionary);
-  assert(dict->data.dictionary.size < dict->data.dictionary.capacity);
-  if (key.type == kObjectTypeString) {
-    dict->data.dictionary.items[dict->data.dictionary.size].key
-        = key.data.string;
-  } else {
-    api_free_object(key);
-    dict->data.dictionary.items[dict->data.dictionary.size].key
-        = STATIC_CSTR_TO_STRING("__INVALID_KEY__");
-  }
-}
-
-#define TYPVAL_ENCODE_CONV_DICT_AFTER_KEY(tv, dict) \
-    typval_encode_after_key(edata)
-
-static inline void typval_encode_between_dict_items(EncodedData *const edata)
-  FUNC_ATTR_ALWAYS_INLINE FUNC_ATTR_NONNULL_ALL
-{
-  Object val = kv_pop(edata->stack);
-  Object *const dict = &kv_last(edata->stack);
-  assert(dict->type == kObjectTypeDictionary);
-  assert(dict->data.dictionary.size < dict->data.dictionary.capacity);
-  dict->data.dictionary.items[dict->data.dictionary.size++].value = val;
-}
-
-#define TYPVAL_ENCODE_CONV_DICT_BETWEEN_ITEMS(tv, dict) \
-    typval_encode_between_dict_items(edata)
-
-static inline void typval_encode_dict_end(EncodedData *const edata)
-  FUNC_ATTR_ALWAYS_INLINE FUNC_ATTR_NONNULL_ALL
-{
-  typval_encode_between_dict_items(edata);
-#ifndef NDEBUG
-  const Object *const dict = &kv_last(edata->stack);
-  assert(dict->data.dictionary.size == dict->data.dictionary.capacity);
-#endif
-}
-
-#define TYPVAL_ENCODE_CONV_DICT_END(tv, dict) \
-    typval_encode_dict_end(edata)
-
-#define TYPVAL_ENCODE_CONV_RECURSE(val, conv_type) \
-    TYPVAL_ENCODE_CONV_NIL(val)
-
-#define TYPVAL_ENCODE_SCOPE static
-#define TYPVAL_ENCODE_NAME object
-#define TYPVAL_ENCODE_FIRST_ARG_TYPE EncodedData *const
-#define TYPVAL_ENCODE_FIRST_ARG_NAME edata
-#include "nvim/eval/typval_encode.c.h"
-#undef TYPVAL_ENCODE_SCOPE
-#undef TYPVAL_ENCODE_NAME
-#undef TYPVAL_ENCODE_FIRST_ARG_TYPE
-#undef TYPVAL_ENCODE_FIRST_ARG_NAME
-
-#undef TYPVAL_ENCODE_CONV_STRING
-#undef TYPVAL_ENCODE_CONV_STR_STRING
-#undef TYPVAL_ENCODE_CONV_EXT_STRING
-#undef TYPVAL_ENCODE_CONV_NUMBER
-#undef TYPVAL_ENCODE_CONV_FLOAT
-#undef TYPVAL_ENCODE_CONV_FUNC_START
-#undef TYPVAL_ENCODE_CONV_FUNC_BEFORE_ARGS
-#undef TYPVAL_ENCODE_CONV_FUNC_BEFORE_SELF
-#undef TYPVAL_ENCODE_CONV_FUNC_END
-#undef TYPVAL_ENCODE_CONV_EMPTY_LIST
-#undef TYPVAL_ENCODE_CONV_LIST_START
-#undef TYPVAL_ENCODE_CONV_REAL_LIST_AFTER_START
-#undef TYPVAL_ENCODE_CONV_EMPTY_DICT
-#undef TYPVAL_ENCODE_CONV_NIL
-#undef TYPVAL_ENCODE_CONV_BOOL
-#undef TYPVAL_ENCODE_CONV_UNSIGNED_NUMBER
-#undef TYPVAL_ENCODE_CONV_DICT_START
-#undef TYPVAL_ENCODE_CONV_REAL_DICT_AFTER_START
-#undef TYPVAL_ENCODE_CONV_DICT_END
-#undef TYPVAL_ENCODE_CONV_DICT_AFTER_KEY
-#undef TYPVAL_ENCODE_CONV_DICT_BETWEEN_ITEMS
-#undef TYPVAL_ENCODE_SPECIAL_DICT_KEY_CHECK
-#undef TYPVAL_ENCODE_CONV_LIST_END
-#undef TYPVAL_ENCODE_CONV_LIST_BETWEEN_ITEMS
-#undef TYPVAL_ENCODE_CONV_RECURSE
-#undef TYPVAL_ENCODE_ALLOW_SPECIALS
-
-/// Convert a vim object to an `Object` instance, recursively expanding
-/// Arrays/Dictionaries.
-///
-/// @param obj The source object
-/// @return The converted value
-Object vim_to_object(typval_T *obj)
-{
-  EncodedData edata = { .stack = KV_INITIAL_VALUE };
-  const int evo_ret = encode_vim_to_object(&edata, obj,
-                                           "vim_to_object argument");
-  (void)evo_ret;
-  assert(evo_ret == OK);
-  Object ret = kv_A(edata.stack, 0);
-  assert(kv_size(edata.stack) == 1);
-  kv_destroy(edata.stack);
-  return ret;
 }
 
 buf_T *find_buffer_by_handle(Buffer buffer, Error *err)
@@ -633,9 +268,9 @@ buf_T *find_buffer_by_handle(Buffer buffer, Error *err)
 
   buf_T *rv = handle_get_buffer(buffer);
 
-  if (!rv) {
-    api_set_error(err, kErrorTypeValidation, "Invalid buffer id: %d", buffer);
-  }
+  VALIDATE_INT(rv, "buffer id", buffer, {
+    return NULL;
+  });
 
   return rv;
 }
@@ -648,9 +283,9 @@ win_T *find_window_by_handle(Window window, Error *err)
 
   win_T *rv = handle_get_window(window);
 
-  if (!rv) {
-    api_set_error(err, kErrorTypeValidation, "Invalid window id: %d", window);
-  }
+  VALIDATE_INT(rv, "window id", window, {
+    return NULL;
+  });
 
   return rv;
 }
@@ -663,9 +298,9 @@ tabpage_T *find_tab_by_handle(Tabpage tabpage, Error *err)
 
   tabpage_T *rv = handle_get_tabpage(tabpage);
 
-  if (!rv) {
-    api_set_error(err, kErrorTypeValidation, "Invalid tabpage id: %d", tabpage);
-  }
+  VALIDATE_INT(rv, "tabpage id", tabpage, {
+    return NULL;
+  });
 
   return rv;
 }
@@ -695,15 +330,25 @@ String cchar_to_string(char c)
 ///         empty String is returned
 String cstr_to_string(const char *str)
 {
-    if (str == NULL) {
-      return (String)STRING_INIT;
-    }
+  if (str == NULL) {
+    return (String)STRING_INIT;
+  }
 
-    size_t len = strlen(str);
-    return (String){
-      .data = xmemdupz(str, len),
-      .size = len,
-    };
+  size_t len = strlen(str);
+  return (String){
+    .data = xmemdupz(str, len),
+    .size = len,
+  };
+}
+
+/// Copies a String to an allocated, NUL-terminated C string.
+///
+/// @param str the String to copy
+/// @return the resulting C string
+char *string_to_cstr(String str)
+  FUNC_ATTR_NONNULL_RET FUNC_ATTR_WARN_UNUSED_RESULT
+{
+  return xstrndup(str.data, str.size);
 }
 
 /// Copies buffer to an allocated String.
@@ -729,18 +374,24 @@ String cstrn_to_string(const char *str, size_t maxsize)
   return cbuf_to_string(str, strnlen(str, maxsize));
 }
 
+String cstrn_as_string(char *str, size_t maxsize)
+  FUNC_ATTR_NONNULL_ALL
+{
+  return cbuf_as_string(str, strnlen(str, maxsize));
+}
+
 /// Creates a String using the given C string. Unlike
 /// cstr_to_string this function DOES NOT copy the C string.
 ///
 /// @param str the C string to use
 /// @return The resulting String, or an empty String if
 ///           str was NULL
-String cstr_as_string(char *str) FUNC_ATTR_PURE
+String cstr_as_string(const char *str) FUNC_ATTR_PURE
 {
   if (str == NULL) {
     return (String)STRING_INIT;
   }
-  return (String){ .data = str, .size = strlen(str) };
+  return (String){ .data = (char *)str, .size = strlen(str) };
 }
 
 /// Return the owned memory of a ga as a String
@@ -764,9 +415,10 @@ String ga_take_string(garray_T *ga)
 /// @param input  Binary string
 /// @param crlf  Also break lines at CR and CRLF.
 /// @return [allocated] String array
-Array string_to_array(const String input, bool crlf)
+Array string_to_array(const String input, bool crlf, Arena *arena)
 {
-  Array ret = ARRAY_DICT_INIT;
+  ArrayBuilder ret = ARRAY_DICT_INIT;
+  kvi_init(ret);
   for (size_t i = 0; i < input.size; i++) {
     const char *start = input.data + i;
     const char *end = start;
@@ -781,435 +433,138 @@ Array string_to_array(const String input, bool crlf)
     if (crlf && *end == CAR && i + 1 < input.size && *(end + 1) == NL) {
       i += 1;  // Advance past CRLF.
     }
-    String s = {
-      .size = line_len,
-      .data = xmemdupz(start, line_len),
-    };
+    String s = CBUF_TO_ARENA_STR(arena, start, line_len);
     memchrsub(s.data, NUL, NL, line_len);
-    ADD(ret, STRING_OBJ(s));
+    kvi_push(ret, STRING_OBJ(s));
     // If line ends at end-of-buffer, add empty final item.
     // This is "readfile()-style", see also ":help channel-lines".
     if (i + 1 == input.size && (*end == NL || (crlf && *end == CAR))) {
-      ADD(ret, STRING_OBJ(STRING_INIT));
+      kvi_push(ret, STRING_OBJ(CBUF_TO_ARENA_STR(arena, "", 0)));
     }
   }
 
-  return ret;
+  return arena_take_arraybuilder(arena, &ret);
 }
 
-/// Set, tweak, or remove a mapping in a mode. Acts as the implementation for
-/// functions like @ref nvim_buf_set_keymap.
-///
-/// Arguments are handled like @ref nvim_set_keymap unless noted.
-/// @param  buffer    Buffer handle for a specific buffer, or 0 for the current
-///                   buffer, or -1 to signify global behavior ("all buffers")
-/// @param  is_unmap  When true, removes the mapping that matches {lhs}.
-void modify_keymap(Buffer buffer, bool is_unmap, String mode, String lhs,
-                   String rhs, Dictionary opts, Error *err)
+/// Normalizes 0-based indexes to buffer line numbers.
+int64_t normalize_index(buf_T *buf, int64_t index, bool end_exclusive, bool *oob)
 {
-  char *err_msg = NULL;  // the error message to report, if any
-  char *err_arg = NULL;  // argument for the error message format string
-  ErrorType err_type = kErrorTypeNone;
+  assert(buf->b_ml.ml_line_count > 0);
+  int64_t max_index = buf->b_ml.ml_line_count + (int)end_exclusive - 1;
+  // A negative index counts from the bottom.
+  index = index < 0 ? max_index + index + 1 : index;
 
-  char_u *lhs_buf = NULL;
-  char_u *rhs_buf = NULL;
-
-  bool global = (buffer == -1);
-  if (global) {
-    buffer = 0;
+  // Check for oob and clamp.
+  if (index > max_index) {
+    *oob = true;
+    index = max_index;
+  } else if (index < 0) {
+    *oob = true;
+    index = 0;
   }
-  buf_T *target_buf = find_buffer_by_handle(buffer, err);
-
-  if (!target_buf) {
-    return;
-  }
-
-  MapArguments parsed_args;
-  memset(&parsed_args, 0, sizeof(parsed_args));
-  if (parse_keymap_opts(opts, &parsed_args, err)) {
-    goto fail_and_free;
-  }
-  parsed_args.buffer = !global;
-
-  set_maparg_lhs_rhs((char_u *)lhs.data, lhs.size,
-                     (char_u *)rhs.data, rhs.size,
-                     CPO_TO_CPO_FLAGS, &parsed_args);
-
-  if (parsed_args.lhs_len > MAXMAPLEN) {
-    err_msg = "LHS exceeds maximum map length: %s";
-    err_arg = lhs.data;
-    err_type = kErrorTypeValidation;
-    goto fail_with_message;
-  }
-
-  if (mode.size > 1) {
-    err_msg = "Shortname is too long: %s";
-    err_arg = mode.data;
-    err_type = kErrorTypeValidation;
-    goto fail_with_message;
-  }
-  int mode_val;  // integer value of the mapping mode, to be passed to do_map()
-  char_u *p = (char_u *)((mode.size) ? mode.data : "m");
-  if (STRNCMP(p, "!", 2) == 0) {
-    mode_val = get_map_mode(&p, true);  // mapmode-ic
-  } else {
-    mode_val = get_map_mode(&p, false);
-    if ((mode_val == VISUAL + SELECTMODE + NORMAL + OP_PENDING)
-        && mode.size > 0) {
-      // get_map_mode() treats unrecognized mode shortnames as ":map".
-      // This is an error unless the given shortname was empty string "".
-      err_msg = "Invalid mode shortname: \"%s\"";
-      err_arg = (char *)p;
-      err_type = kErrorTypeValidation;
-      goto fail_with_message;
-    }
-  }
-
-  if (parsed_args.lhs_len == 0) {
-    err_msg = "Invalid (empty) LHS";
-    err_arg = "";
-    err_type = kErrorTypeValidation;
-    goto fail_with_message;
-  }
-
-  bool is_noremap = parsed_args.noremap;
-  assert(!(is_unmap && is_noremap));
-
-  if (!is_unmap && (parsed_args.rhs_len == 0 && !parsed_args.rhs_is_noop)) {
-    if (rhs.size == 0) {  // assume that the user wants RHS to be a <Nop>
-      parsed_args.rhs_is_noop = true;
-    } else {
-      // the given RHS was nonempty and not a <Nop>, but was parsed as if it
-      // were empty?
-      assert(false && "Failed to parse nonempty RHS!");
-      err_msg = "Parsing of nonempty RHS failed: %s";
-      err_arg = rhs.data;
-      err_type = kErrorTypeException;
-      goto fail_with_message;
-    }
-  } else if (is_unmap && parsed_args.rhs_len) {
-    err_msg = "Gave nonempty RHS in unmap command: %s";
-    err_arg = (char *)parsed_args.rhs;
-    err_type = kErrorTypeValidation;
-    goto fail_with_message;
-  }
-
-  // buf_do_map() reads noremap/unmap as its own argument.
-  int maptype_val = 0;
-  if (is_unmap) {
-    maptype_val = 1;
-  } else if (is_noremap) {
-    maptype_val = 2;
-  }
-
-  switch (buf_do_map(maptype_val, &parsed_args, mode_val, 0, target_buf)) {
-    case 0:
-      break;
-    case 1:
-      api_set_error(err, kErrorTypeException, (char *)e_invarg, 0);
-      goto fail_and_free;
-    case 2:
-      api_set_error(err, kErrorTypeException, (char *)e_nomap, 0);
-      goto fail_and_free;
-    case 5:
-      api_set_error(err, kErrorTypeException,
-                    "E227: mapping already exists for %s", parsed_args.lhs);
-      goto fail_and_free;
-    default:
-      assert(false && "Unrecognized return code!");
-      goto fail_and_free;
-  }  // switch
-
-  xfree(lhs_buf);
-  xfree(rhs_buf);
-  xfree(parsed_args.rhs);
-  xfree(parsed_args.orig_rhs);
-
-  return;
-
-fail_with_message:
-  api_set_error(err, err_type, err_msg, err_arg);
-
-fail_and_free:
-  xfree(lhs_buf);
-  xfree(rhs_buf);
-  xfree(parsed_args.rhs);
-  xfree(parsed_args.orig_rhs);
-  return;
+  // Convert the index to a 1-based line number.
+  index++;
+  return index;
 }
 
-/// Read in the given opts, setting corresponding flags in `out`.
+/// Returns a substring of a buffer line
 ///
-/// @param opts A dictionary passed to @ref nvim_set_keymap or
-///             @ref nvim_buf_set_keymap.
-/// @param[out]   out  MapArguments object in which to set parsed
-///                    |:map-arguments| flags.
-/// @param[out]   err  Error details, if any.
-///
-/// @returns Zero on success, nonzero on failure.
-Integer parse_keymap_opts(Dictionary opts, MapArguments *out, Error *err)
+/// @param buf          Buffer id
+/// @param lnum         Line number (1-based)
+/// @param start_col    Starting byte offset into line (0-based)
+/// @param end_col      Ending byte offset into line (0-based, exclusive)
+/// @param err          Error object
+/// @return The text between start_col and end_col on line lnum of buffer buf
+String buf_get_text(buf_T *buf, int64_t lnum, int64_t start_col, int64_t end_col, Error *err)
 {
-  char *err_msg = NULL;  // the error message to report, if any
-  char *err_arg = NULL;  // argument for the error message format string
-  ErrorType err_type = kErrorTypeNone;
+  String rv = STRING_INIT;
 
-  out->buffer = false;
-  out->nowait = false;
-  out->silent = false;
-  out->script = false;
-  out->expr = false;
-  out->unique = false;
+  VALIDATE_RANGE((lnum < MAXLNUM), "line index", {
+    return rv;
+  });
 
-  for (size_t i = 0; i < opts.size; i++) {
-    KeyValuePair *key_and_val = &opts.items[i];
-    char *optname = key_and_val->key.data;
+  char *bufstr = ml_get_buf(buf, (linenr_T)lnum);
+  colnr_T line_length = ml_get_buf_len(buf, (linenr_T)lnum);
 
-    if (key_and_val->value.type != kObjectTypeBoolean) {
-      err_msg = "Gave non-boolean value for an opt: %s";
-      err_arg = optname;
-      err_type = kErrorTypeValidation;
-      goto fail_with_message;
-    }
+  start_col = start_col < 0 ? line_length + start_col + 1 : start_col;
+  end_col = end_col < 0 ? line_length + end_col + 1 : end_col;
 
-    bool was_valid_opt = false;
-    switch (optname[0]) {
-      // note: strncmp up to and including the null terminator, so that
-      // "nowaitFoobar" won't match against "nowait"
+  start_col = MIN(MAX(0, start_col), line_length);
+  end_col = MIN(MAX(0, end_col), line_length);
 
-      // don't recognize 'buffer' as a key; user shouldn't provide <buffer>
-      // when calling nvim_set_keymap or nvim_buf_set_keymap, since it can be
-      // inferred from which function they called
-      case 'n':
-        if (STRNCMP(optname, "noremap", 8) == 0) {
-          was_valid_opt = true;
-          out->noremap = key_and_val->value.data.boolean;
-        } else if (STRNCMP(optname, "nowait", 7) == 0) {
-          was_valid_opt = true;
-          out->nowait = key_and_val->value.data.boolean;
-        }
-        break;
-      case 's':
-        if (STRNCMP(optname, "silent", 7) == 0) {
-          was_valid_opt = true;
-          out->silent = key_and_val->value.data.boolean;
-        } else if (STRNCMP(optname, "script", 7) == 0) {
-          was_valid_opt = true;
-          out->script = key_and_val->value.data.boolean;
-        }
-        break;
-      case 'e':
-        if (STRNCMP(optname, "expr", 5) == 0) {
-          was_valid_opt = true;
-          out->expr = key_and_val->value.data.boolean;
-        }
-        break;
-      case 'u':
-        if (STRNCMP(optname, "unique", 7) == 0) {
-          was_valid_opt = true;
-          out->unique = key_and_val->value.data.boolean;
-        }
-        break;
-      default:
-        break;
-    }  // switch
-    if (!was_valid_opt) {
-      err_msg = "Invalid key: %s";
-      err_arg = optname;
-      err_type = kErrorTypeValidation;
-      goto fail_with_message;
-    }
-  }  // for
-
-  return 0;
-
-fail_with_message:
-  api_set_error(err, err_type, err_msg, err_arg);
-  return 1;
-}
-
-/// Collects `n` buffer lines into array `l`, optionally replacing newlines
-/// with NUL.
-///
-/// @param buf Buffer to get lines from
-/// @param n Number of lines to collect
-/// @param replace_nl Replace newlines ("\n") with NUL
-/// @param start Line number to start from
-/// @param[out] l Lines are copied here
-/// @param err[out] Error, if any
-/// @return true unless `err` was set
-bool buf_collect_lines(buf_T *buf, size_t n, int64_t start, bool replace_nl,
-                       Array *l, Error *err)
-{
-  for (size_t i = 0; i < n; i++) {
-    int64_t lnum = start + (int64_t)i;
-
-    if (lnum >= MAXLNUM) {
-      if (err != NULL) {
-        api_set_error(err, kErrorTypeValidation, "Line index is too high");
-      }
-      return false;
-    }
-
-    const char *bufstr = (char *)ml_get_buf(buf, (linenr_T)lnum, false);
-    Object str = STRING_OBJ(cstr_to_string(bufstr));
-
-    if (replace_nl) {
-      // Vim represents NULs as NLs, but this may confuse clients.
-      strchrsub(str.data.string.data, '\n', '\0');
-    }
-
-    l->items[i] = str;
+  if (start_col > end_col) {
+    api_set_error(err, kErrorTypeValidation, "start_col must be less than or equal to end_col");
+    return rv;
   }
 
-  return true;
-}
-
-/// Converts from type Object to a VimL value.
-///
-/// @param obj  Object to convert from.
-/// @param tv   Conversion result is placed here. On failure member v_type is
-///             set to VAR_UNKNOWN (no allocation was made for this variable).
-/// returns     true if conversion is successful, otherwise false.
-bool object_to_vim(Object obj, typval_T *tv, Error *err)
-{
-  tv->v_type = VAR_UNKNOWN;
-  tv->v_lock = VAR_UNLOCKED;
-
-  switch (obj.type) {
-    case kObjectTypeNil:
-      tv->v_type = VAR_SPECIAL;
-      tv->vval.v_special = kSpecialVarNull;
-      break;
-
-    case kObjectTypeBoolean:
-      tv->v_type = VAR_BOOL;
-      tv->vval.v_bool = obj.data.boolean? kBoolVarTrue: kBoolVarFalse;
-      break;
-
-    case kObjectTypeBuffer:
-    case kObjectTypeWindow:
-    case kObjectTypeTabpage:
-    case kObjectTypeInteger:
-      STATIC_ASSERT(sizeof(obj.data.integer) <= sizeof(varnumber_T),
-                    "Integer size must be <= VimL number size");
-      tv->v_type = VAR_NUMBER;
-      tv->vval.v_number = (varnumber_T)obj.data.integer;
-      break;
-
-    case kObjectTypeFloat:
-      tv->v_type = VAR_FLOAT;
-      tv->vval.v_float = obj.data.floating;
-      break;
-
-    case kObjectTypeString:
-      tv->v_type = VAR_STRING;
-      if (obj.data.string.data == NULL) {
-        tv->vval.v_string = NULL;
-      } else {
-        tv->vval.v_string = xmemdupz(obj.data.string.data,
-                                     obj.data.string.size);
-      }
-      break;
-
-    case kObjectTypeArray: {
-      list_T *const list = tv_list_alloc((ptrdiff_t)obj.data.array.size);
-
-      for (uint32_t i = 0; i < obj.data.array.size; i++) {
-        Object item = obj.data.array.items[i];
-        typval_T li_tv;
-
-        if (!object_to_vim(item, &li_tv, err)) {
-          tv_list_free(list);
-          return false;
-        }
-
-        tv_list_append_owned_tv(list, li_tv);
-      }
-      tv_list_ref(list);
-
-      tv->v_type = VAR_LIST;
-      tv->vval.v_list = list;
-      break;
-    }
-
-    case kObjectTypeDictionary: {
-      dict_T *const dict = tv_dict_alloc();
-
-      for (uint32_t i = 0; i < obj.data.dictionary.size; i++) {
-        KeyValuePair item = obj.data.dictionary.items[i];
-        String key = item.key;
-
-        if (key.size == 0) {
-          api_set_error(err, kErrorTypeValidation,
-                        "Empty dictionary keys aren't allowed");
-          // cleanup
-          tv_dict_free(dict);
-          return false;
-        }
-
-        dictitem_T *const di = tv_dict_item_alloc(key.data);
-
-        if (!object_to_vim(item.value, &di->di_tv, err)) {
-          // cleanup
-          tv_dict_item_free(di);
-          tv_dict_free(dict);
-          return false;
-        }
-
-        tv_dict_add(dict, di);
-      }
-      dict->dv_refcount++;
-
-      tv->v_type = VAR_DICT;
-      tv->vval.v_dict = dict;
-      break;
-    }
-    default:
-      abort();
-  }
-
-  return true;
+  return cbuf_as_string(bufstr + start_col, (size_t)(end_col - start_col));
 }
 
 void api_free_string(String value)
 {
-  if (!value.data) {
-    return;
-  }
-
   xfree(value.data);
+}
+
+Array arena_array(Arena *arena, size_t max_size)
+{
+  Array arr = ARRAY_DICT_INIT;
+  kv_fixsize_arena(arena, arr, max_size);
+  return arr;
+}
+
+Dict arena_dict(Arena *arena, size_t max_size)
+{
+  Dict dict = ARRAY_DICT_INIT;
+  kv_fixsize_arena(arena, dict, max_size);
+  return dict;
+}
+
+String arena_string(Arena *arena, String str)
+{
+  if (str.size) {
+    return cbuf_as_string(arena_memdupz(arena, str.data, str.size), str.size);
+  } else {
+    return (String){ .data = arena ? "" : xstrdup(""), .size = 0 };
+  }
+}
+
+Array arena_take_arraybuilder(Arena *arena, ArrayBuilder *arr)
+{
+  Array ret = arena_array(arena, kv_size(*arr));
+  ret.size = kv_size(*arr);
+  memcpy(ret.items, arr->items, sizeof(ret.items[0]) * ret.size);
+  kvi_destroy(*arr);
+  return ret;
 }
 
 void api_free_object(Object value)
 {
   switch (value.type) {
-    case kObjectTypeNil:
-    case kObjectTypeBoolean:
-    case kObjectTypeInteger:
-    case kObjectTypeFloat:
-    case kObjectTypeBuffer:
-    case kObjectTypeWindow:
-    case kObjectTypeTabpage:
-      break;
+  case kObjectTypeUnset:
+  case kObjectTypeNil:
+  case kObjectTypeBoolean:
+  case kObjectTypeInteger:
+  case kObjectTypeFloat:
+  case kObjectTypeBuffer:
+  case kObjectTypeWindow:
+  case kObjectTypeTabpage:
+    break;
 
-    case kObjectTypeString:
-      api_free_string(value.data.string);
-      break;
+  case kObjectTypeString:
+    api_free_string(value.data.string);
+    break;
 
-    case kObjectTypeArray:
-      api_free_array(value.data.array);
-      break;
+  case kObjectTypeArray:
+    api_free_array(value.data.array);
+    break;
 
-    case kObjectTypeDictionary:
-      api_free_dictionary(value.data.dictionary);
-      break;
+  case kObjectTypeDict:
+    api_free_dict(value.data.dict);
+    break;
 
-    case kObjectTypeLuaRef:
-      api_free_luaref(value.data.luaref);
-      break;
-
-    default:
-      abort();
+  case kObjectTypeLuaRef:
+    api_free_luaref(value.data.luaref);
+    break;
   }
 }
 
@@ -1222,7 +577,7 @@ void api_free_array(Array value)
   xfree(value.items);
 }
 
-void api_free_dictionary(Dictionary value)
+void api_free_dict(Dict value)
 {
   for (size_t i = 0; i < value.size; i++) {
     api_free_string(value.items[i].key);
@@ -1243,221 +598,91 @@ void api_clear_error(Error *value)
   value->type = kErrorTypeNone;
 }
 
-Dictionary api_metadata(void)
+// initialized once, never freed
+static ArenaMem mem_for_metadata = NULL;
+
+/// @returns a shared value. caller must not modify it!
+Object api_metadata(void)
 {
-  static Dictionary metadata = ARRAY_DICT_INIT;
+  static Object metadata = OBJECT_INIT;
 
-  if (!metadata.size) {
-    PUT(metadata, "version", DICTIONARY_OBJ(version_dict()));
-    init_function_metadata(&metadata);
-    init_ui_event_metadata(&metadata);
-    init_error_type_metadata(&metadata);
-    init_type_metadata(&metadata);
-  }
-
-  return copy_object(DICTIONARY_OBJ(metadata)).data.dictionary;
-}
-
-static void init_function_metadata(Dictionary *metadata)
-{
-  msgpack_unpacked unpacked;
-  msgpack_unpacked_init(&unpacked);
-  if (msgpack_unpack_next(&unpacked,
-                          (const char *)funcs_metadata,
-                          sizeof(funcs_metadata),
-                          NULL) != MSGPACK_UNPACK_SUCCESS) {
-    abort();
-  }
-  Object functions;
-  msgpack_rpc_to_object(&unpacked.data, &functions);
-  msgpack_unpacked_destroy(&unpacked);
-  PUT(*metadata, "functions", functions);
-}
-
-static void init_ui_event_metadata(Dictionary *metadata)
-{
-  msgpack_unpacked unpacked;
-  msgpack_unpacked_init(&unpacked);
-  if (msgpack_unpack_next(&unpacked,
-                          (const char *)ui_events_metadata,
-                          sizeof(ui_events_metadata),
-                          NULL) != MSGPACK_UNPACK_SUCCESS) {
-    abort();
-  }
-  Object ui_events;
-  msgpack_rpc_to_object(&unpacked.data, &ui_events);
-  msgpack_unpacked_destroy(&unpacked);
-  PUT(*metadata, "ui_events", ui_events);
-  Array ui_options = ARRAY_DICT_INIT;
-  ADD(ui_options, STRING_OBJ(cstr_to_string("rgb")));
-  for (UIExtension i = 0; i < kUIExtCount; i++) {
-    if (ui_ext_names[i][0] != '_') {
-      ADD(ui_options, STRING_OBJ(cstr_to_string(ui_ext_names[i])));
+  if (metadata.type == kObjectTypeNil) {
+    Arena arena = ARENA_EMPTY;
+    Error err = ERROR_INIT;
+    metadata = unpack((char *)packed_api_metadata, sizeof(packed_api_metadata), &arena, &err);
+    if (ERROR_SET(&err) || metadata.type != kObjectTypeDict) {
+      abort();
     }
+    mem_for_metadata = arena_finish(&arena);
   }
-  PUT(*metadata, "ui_options", ARRAY_OBJ(ui_options));
+
+  return metadata;
 }
 
-static void init_error_type_metadata(Dictionary *metadata)
+String api_metadata_raw(void)
 {
-  Dictionary types = ARRAY_DICT_INIT;
-
-  Dictionary exception_metadata = ARRAY_DICT_INIT;
-  PUT(exception_metadata, "id", INTEGER_OBJ(kErrorTypeException));
-
-  Dictionary validation_metadata = ARRAY_DICT_INIT;
-  PUT(validation_metadata, "id", INTEGER_OBJ(kErrorTypeValidation));
-
-  PUT(types, "Exception", DICTIONARY_OBJ(exception_metadata));
-  PUT(types, "Validation", DICTIONARY_OBJ(validation_metadata));
-
-  PUT(*metadata, "error_types", DICTIONARY_OBJ(types));
+  return cbuf_as_string((char *)packed_api_metadata, sizeof(packed_api_metadata));
 }
 
-static void init_type_metadata(Dictionary *metadata)
-{
-  Dictionary types = ARRAY_DICT_INIT;
+// all the copy_[object] functions allow arena=NULL,
+// then global allocations are used, and the resulting object
+// should be freed with an api_free_[object] function
 
-  Dictionary buffer_metadata = ARRAY_DICT_INIT;
-  PUT(buffer_metadata, "id",
-      INTEGER_OBJ(kObjectTypeBuffer - EXT_OBJECT_TYPE_SHIFT));
-  PUT(buffer_metadata, "prefix", STRING_OBJ(cstr_to_string("nvim_buf_")));
-
-  Dictionary window_metadata = ARRAY_DICT_INIT;
-  PUT(window_metadata, "id",
-      INTEGER_OBJ(kObjectTypeWindow - EXT_OBJECT_TYPE_SHIFT));
-  PUT(window_metadata, "prefix", STRING_OBJ(cstr_to_string("nvim_win_")));
-
-  Dictionary tabpage_metadata = ARRAY_DICT_INIT;
-  PUT(tabpage_metadata, "id",
-      INTEGER_OBJ(kObjectTypeTabpage - EXT_OBJECT_TYPE_SHIFT));
-  PUT(tabpage_metadata, "prefix", STRING_OBJ(cstr_to_string("nvim_tabpage_")));
-
-  PUT(types, "Buffer", DICTIONARY_OBJ(buffer_metadata));
-  PUT(types, "Window", DICTIONARY_OBJ(window_metadata));
-  PUT(types, "Tabpage", DICTIONARY_OBJ(tabpage_metadata));
-
-  PUT(*metadata, "types", DICTIONARY_OBJ(types));
-}
-
-String copy_string(String str)
+String copy_string(String str, Arena *arena)
 {
   if (str.data != NULL) {
-    return (String){ .data = xmemdupz(str.data, str.size), .size = str.size };
+    return (String){ .data = arena_memdupz(arena, str.data, str.size), .size = str.size };
   } else {
     return (String)STRING_INIT;
   }
 }
 
-Array copy_array(Array array)
+Array copy_array(Array array, Arena *arena)
 {
-  Array rv = ARRAY_DICT_INIT;
+  Array rv = arena_array(arena, array.size);
   for (size_t i = 0; i < array.size; i++) {
-    ADD(rv, copy_object(array.items[i]));
+    ADD(rv, copy_object(array.items[i], arena));
   }
   return rv;
 }
 
-Dictionary copy_dictionary(Dictionary dict)
+Dict copy_dict(Dict dict, Arena *arena)
 {
-  Dictionary rv = ARRAY_DICT_INIT;
+  Dict rv = arena_dict(arena, dict.size);
   for (size_t i = 0; i < dict.size; i++) {
     KeyValuePair item = dict.items[i];
-    PUT(rv, item.key.data, copy_object(item.value));
+    PUT_C(rv, copy_string(item.key, arena).data, copy_object(item.value, arena));
   }
   return rv;
 }
 
 /// Creates a deep clone of an object
-Object copy_object(Object obj)
+Object copy_object(Object obj, Arena *arena)
 {
   switch (obj.type) {
-    case kObjectTypeBuffer:
-    case kObjectTypeTabpage:
-    case kObjectTypeWindow:
-    case kObjectTypeNil:
-    case kObjectTypeBoolean:
-    case kObjectTypeInteger:
-    case kObjectTypeFloat:
-      return obj;
+  case kObjectTypeUnset:
+  case kObjectTypeBuffer:
+  case kObjectTypeTabpage:
+  case kObjectTypeWindow:
+  case kObjectTypeNil:
+  case kObjectTypeBoolean:
+  case kObjectTypeInteger:
+  case kObjectTypeFloat:
+    return obj;
 
-    case kObjectTypeString:
-      return STRING_OBJ(copy_string(obj.data.string));
+  case kObjectTypeString:
+    return STRING_OBJ(copy_string(obj.data.string, arena));
 
-    case kObjectTypeArray:
-      return ARRAY_OBJ(copy_array(obj.data.array));
+  case kObjectTypeArray:
+    return ARRAY_OBJ(copy_array(obj.data.array, arena));
 
-    case kObjectTypeDictionary: {
-      return DICTIONARY_OBJ(copy_dictionary(obj.data.dictionary));
-    }
-    default:
-      abort();
+  case kObjectTypeDict:
+    return DICT_OBJ(copy_dict(obj.data.dict, arena));
+
+  case kObjectTypeLuaRef:
+    return LUAREF_OBJ(api_new_luaref(obj.data.luaref));
   }
-}
-
-static void set_option_value_for(char *key,
-                                 int numval,
-                                 char *stringval,
-                                 int opt_flags,
-                                 int opt_type,
-                                 void *from,
-                                 Error *err)
-{
-  win_T *save_curwin = NULL;
-  tabpage_T *save_curtab = NULL;
-  aco_save_T aco;
-
-  try_start();
-  switch (opt_type)
-  {
-    case SREQ_WIN:
-      if (switch_win(&save_curwin, &save_curtab, (win_T *)from,
-            win_find_tabpage((win_T *)from), false) == FAIL)
-      {
-        if (try_end(err)) {
-          return;
-        }
-        api_set_error(err,
-                      kErrorTypeException,
-                      "Problem while switching windows");
-        return;
-      }
-      set_option_value_err(key, numval, stringval, opt_flags, err);
-      restore_win(save_curwin, save_curtab, true);
-      break;
-    case SREQ_BUF:
-      aucmd_prepbuf(&aco, (buf_T *)from);
-      set_option_value_err(key, numval, stringval, opt_flags, err);
-      aucmd_restbuf(&aco);
-      break;
-    case SREQ_GLOBAL:
-      set_option_value_err(key, numval, stringval, opt_flags, err);
-      break;
-  }
-
-  if (ERROR_SET(err)) {
-    return;
-  }
-
-  try_end(err);
-}
-
-
-static void set_option_value_err(char *key,
-                                 int numval,
-                                 char *stringval,
-                                 int opt_flags,
-                                 Error *err)
-{
-  char *errmsg;
-
-  if ((errmsg = set_option_value(key, numval, stringval, opt_flags))) {
-    if (try_end(err)) {
-      return;
-    }
-
-    api_set_error(err, kErrorTypeException, "%s", errmsg);
-  }
+  UNREACHABLE;
 }
 
 void api_set_error(Error *err, ErrorType errType, const char *format, ...)
@@ -1480,167 +705,22 @@ void api_set_error(Error *err, ErrorType errType, const char *format, ...)
   err->type = errType;
 }
 
-/// Get an array containing dictionaries describing mappings
-/// based on mode and buffer id
-///
-/// @param  mode  The abbreviation for the mode
-/// @param  buf  The buffer to get the mapping array. NULL for global
-/// @returns Array of maparg()-like dictionaries describing mappings
-ArrayOf(Dictionary) keymap_array(String mode, buf_T *buf)
-{
-  Array mappings = ARRAY_DICT_INIT;
-  dict_T *const dict = tv_dict_alloc();
-
-  // Convert the string mode to the integer mode
-  // that is stored within each mapblock
-  char_u *p = (char_u *)mode.data;
-  int int_mode = get_map_mode(&p, 0);
-
-  // Determine the desired buffer value
-  long buffer_value = (buf == NULL) ? 0 : buf->handle;
-
-  for (int i = 0; i < MAX_MAPHASH; i++) {
-    for (const mapblock_T *current_maphash = get_maphash(i, buf);
-         current_maphash;
-         current_maphash = current_maphash->m_next) {
-      // Check for correct mode
-      if (int_mode & current_maphash->m_mode) {
-        mapblock_fill_dict(dict, current_maphash, buffer_value, false);
-        ADD(mappings, vim_to_object(
-            (typval_T[]) { { .v_type = VAR_DICT, .vval.v_dict = dict } }));
-
-        tv_dict_clear(dict);
-      }
-    }
-  }
-  tv_dict_free(dict);
-
-  return mappings;
-}
-
-// Is the Namespace in use?
-bool ns_initialized(uint64_t ns)
-{
-  if (ns < 1) {
-    return false;
-  }
-  return ns < (uint64_t)next_namespace_id;
-}
-
-/// Gets the line and column of an extmark.
-///
-/// Extmarks may be queried by position, name or even special names
-/// in the future such as "cursor".
-///
-/// @param[out] lnum extmark line
-/// @param[out] colnr extmark column
-///
-/// @return true if the extmark was found, else false
-bool extmark_get_index_from_obj(buf_T *buf, Integer ns_id, Object obj, int
-                                *row, colnr_T *col, Error *err)
-{
-  // Check if it is mark id
-  if (obj.type == kObjectTypeInteger) {
-    Integer id = obj.data.integer;
-    if (id == 0) {
-        *row = 0;
-        *col = 0;
-        return true;
-    } else if (id == -1) {
-        *row = MAXLNUM;
-        *col = MAXCOL;
-        return true;
-    } else if (id < 0) {
-      api_set_error(err, kErrorTypeValidation, "Mark id must be positive");
-      return false;
-    }
-
-    ExtmarkInfo extmark = extmark_from_id(buf, (uint64_t)ns_id, (uint64_t)id);
-    if (extmark.row >= 0) {
-      *row = extmark.row;
-      *col = extmark.col;
-      return true;
-    } else {
-      api_set_error(err, kErrorTypeValidation, "No mark with requested id");
-      return false;
-    }
-
-  // Check if it is a position
-  } else if (obj.type == kObjectTypeArray) {
-    Array pos = obj.data.array;
-    if (pos.size != 2
-        || pos.items[0].type != kObjectTypeInteger
-        || pos.items[1].type != kObjectTypeInteger) {
-      api_set_error(err, kErrorTypeValidation,
-                    "Position must have 2 integer elements");
-      return false;
-    }
-    Integer pos_row = pos.items[0].data.integer;
-    Integer pos_col = pos.items[1].data.integer;
-    *row = (int)(pos_row >= 0 ? pos_row  : MAXLNUM);
-    *col = (colnr_T)(pos_col >= 0 ? pos_col : MAXCOL);
-    return true;
-  } else {
-    api_set_error(err, kErrorTypeValidation,
-                  "Position must be a mark id Integer or position Array");
-    return false;
-  }
-}
-
-VirtText parse_virt_text(Array chunks, Error *err)
-{
-  VirtText virt_text = KV_INITIAL_VALUE;
-  for (size_t i = 0; i < chunks.size; i++) {
-    if (chunks.items[i].type != kObjectTypeArray) {
-      api_set_error(err, kErrorTypeValidation, "Chunk is not an array");
-      goto free_exit;
-    }
-    Array chunk = chunks.items[i].data.array;
-    if (chunk.size == 0 || chunk.size > 2
-        || chunk.items[0].type != kObjectTypeString
-        || (chunk.size == 2 && chunk.items[1].type != kObjectTypeString)) {
-      api_set_error(err, kErrorTypeValidation,
-                    "Chunk is not an array with one or two strings");
-      goto free_exit;
-    }
-
-    String str = chunk.items[0].data.string;
-    char *text = transstr(str.size > 0 ? str.data : "");  // allocates
-
-    int hl_id = 0;
-    if (chunk.size == 2) {
-      String hl = chunk.items[1].data.string;
-      if (hl.size > 0) {
-        hl_id = syn_check_group((char_u *)hl.data, (int)hl.size);
-      }
-    }
-    kv_push(virt_text, ((VirtTextChunk){ .text = text, .hl_id = hl_id }));
-  }
-
-  return virt_text;
-
-free_exit:
-  clear_virttext(&virt_text);
-  return virt_text;
-}
-
 /// Force obj to bool.
 /// If it fails, returns false and sets err
 /// @param obj          The object to coerce to a boolean
 /// @param what         The name of the object, used for error message
 /// @param nil_value    What to return if the type is nil.
 /// @param err          Set if there was an error in converting to a bool
-bool api_object_to_bool(Object obj, const char *what,
-                        bool nil_value, Error *err)
+bool api_object_to_bool(Object obj, const char *what, bool nil_value, Error *err)
 {
   if (obj.type == kObjectTypeBoolean) {
     return obj.data.boolean;
   } else if (obj.type == kObjectTypeInteger) {
     return obj.data.integer;  // C semantics: non-zero int is true
   } else if (obj.type == kObjectTypeNil) {
-    return nil_value;  // caller decides what NIL (missing retval in lua) means
+    return nil_value;  // caller decides what NIL (missing retval in Lua) means
   } else {
-    api_set_error(err, kErrorTypeValidation, "%s is not an boolean", what);
+    VALIDATE_EXP(false, what, "boolean", NULL, {});
     return false;
   }
 }
@@ -1649,421 +729,345 @@ int object_to_hl_id(Object obj, const char *what, Error *err)
 {
   if (obj.type == kObjectTypeString) {
     String str = obj.data.string;
-    return str.size ? syn_check_group((char_u *)str.data, (int)str.size) : 0;
+    return str.size ? syn_check_group(str.data, str.size) : 0;
   } else if (obj.type == kObjectTypeInteger) {
-    return (int)obj.data.integer;
+    int id = (int)obj.data.integer;
+    return (1 <= id && id <= highlight_num_groups()) ? id : 0;
   } else {
-    api_set_error(err, kErrorTypeValidation,
-                  "%s is not a valid highlight", what);
+    VALIDATE_S(false, "hl_group", what, {});
     return 0;
   }
 }
 
-HlMessage parse_hl_msg(Array chunks, Error *err)
+char *api_typename(ObjectType t)
+{
+  switch (t) {
+  case kObjectTypeUnset:
+    return "unset";
+  case kObjectTypeNil:
+    return "nil";
+  case kObjectTypeBoolean:
+    return "Boolean";
+  case kObjectTypeInteger:
+    return "Integer";
+  case kObjectTypeFloat:
+    return "Float";
+  case kObjectTypeString:
+    return "String";
+  case kObjectTypeArray:
+    return "Array";
+  case kObjectTypeDict:
+    return "Dict";
+  case kObjectTypeLuaRef:
+    return "Function";
+  case kObjectTypeBuffer:
+    return "Buffer";
+  case kObjectTypeWindow:
+    return "Window";
+  case kObjectTypeTabpage:
+    return "Tabpage";
+  }
+  UNREACHABLE;
+}
+
+HlMessage parse_hl_msg(ArrayOf(Tuple(String, *HLGroupID)) chunks, bool is_err, Error *err)
 {
   HlMessage hl_msg = KV_INITIAL_VALUE;
   for (size_t i = 0; i < chunks.size; i++) {
-    if (chunks.items[i].type != kObjectTypeArray) {
-      api_set_error(err, kErrorTypeValidation, "Chunk is not an array");
+    VALIDATE_T("chunk", kObjectTypeArray, chunks.items[i].type, {
       goto free_exit;
-    }
-    Array chunk = chunks.items[i].data.array;
-    if (chunk.size == 0 || chunk.size > 2
-        || chunk.items[0].type != kObjectTypeString
-        || (chunk.size == 2 && chunk.items[1].type != kObjectTypeString)) {
-      api_set_error(err, kErrorTypeValidation,
-                    "Chunk is not an array with one or two strings");
+    });
+    Tuple(String, *HLGroupID) chunk = chunks.items[i].data.array;
+    VALIDATE((chunk.size > 0 && chunk.size <= 2 && chunk.items[0].type == kObjectTypeString),
+             "%s", "Invalid chunk: expected Array with 1 or 2 Strings", {
       goto free_exit;
-    }
+    });
 
-    String str = copy_string(chunk.items[0].data.string);
+    String str = copy_string(chunk.items[0].data.string, NULL);
 
-    int attr = 0;
-    if (chunk.size == 2) {
-      String hl = chunk.items[1].data.string;
-      if (hl.size > 0) {
-        int hl_id = syn_check_group((char_u *)hl.data, (int)hl.size);
-        attr = hl_id > 0 ? syn_id2attr(hl_id) : 0;
-      }
-    }
-    kv_push(hl_msg, ((HlMessageChunk){ .text = str, .attr = attr }));
+    int hl_id =
+      chunk.size == 2 ? object_to_hl_id(chunk.items[1], "text highlight", err)
+                      : is_err ? HLF_E
+                               : 0;
+    kv_push(hl_msg, ((HlMessageChunk){ .text = str, .hl_id = hl_id }));
   }
 
   return hl_msg;
 
 free_exit:
-  clear_hl_msg(&hl_msg);
-  return hl_msg;
+  hl_msg_free(hl_msg);
+  return (HlMessage)KV_INITIAL_VALUE;
 }
 
-const char *describe_ns(NS ns_id)
+// see also nlua_pop_keydict for the lua specific implementation
+bool api_dict_to_keydict(void *retval, FieldHashfn hashy, Dict dict, Error *err)
 {
-  String name;
-  handle_T id;
-  map_foreach(namespace_ids, name, id, {
-    if ((NS)id == ns_id && name.size) {
-      return name.data;
+  for (size_t i = 0; i < dict.size; i++) {
+    String k = dict.items[i].key;
+    const KeySetLink *field = hashy(k.data, k.size);
+    if (!field) {
+      api_set_error(err, kErrorTypeValidation, "Invalid key: '%.*s'", (int)k.size, k.data);
+      return false;
     }
-  })
-  return "(UNKNOWN PLUGIN)";
-}
 
-static bool parse_float_anchor(String anchor, FloatAnchor *out)
-{
-  if (anchor.size == 0) {
-    *out = (FloatAnchor)0;
-  }
-  char *str = anchor.data;
-  if (striequal(str, "NW")) {
-    *out = 0;  //  NW is the default
-  } else if (striequal(str, "NE")) {
-    *out = kFloatAnchorEast;
-  } else if (striequal(str, "SW")) {
-    *out = kFloatAnchorSouth;
-  } else if (striequal(str, "SE")) {
-    *out = kFloatAnchorSouth | kFloatAnchorEast;
-  } else {
-    return false;
-  }
-  return true;
-}
-
-static bool parse_float_relative(String relative, FloatRelative *out)
-{
-  char *str = relative.data;
-  if (striequal(str, "editor")) {
-    *out = kFloatRelativeEditor;
-  }  else if (striequal(str, "win")) {
-    *out = kFloatRelativeWindow;
-  } else if (striequal(str, "cursor")) {
-    *out = kFloatRelativeCursor;
-  } else {
-    return false;
-  }
-  return true;
-}
-
-static bool parse_float_bufpos(Array bufpos, lpos_T *out)
-{
-  if (bufpos.size != 2
-      || bufpos.items[0].type != kObjectTypeInteger
-      || bufpos.items[1].type != kObjectTypeInteger) {
-    return false;
-  }
-  out->lnum = bufpos.items[0].data.integer;
-  out->col = (colnr_T)bufpos.items[1].data.integer;
-  return true;
-}
-
-static void parse_border_style(Object style, FloatConfig *fconfig, Error *err)
-{
-  struct {
-    const char *name;
-    schar_T chars[8];
-    bool shadow_color;
-  } defaults[] = {
-    { "double", { "╔", "═", "╗", "║", "╝", "═", "╚", "║" }, false },
-    { "single", { "┌", "─", "┐", "│", "┘", "─", "└", "│" }, false },
-    { "shadow", { "", "", " ", " ", " ", " ", " ", "" }, true },
-    { "solid", { " ", " ", " ", " ", " ", " ", " ", " " }, false },
-    { NULL, { { NUL } } , false },
-  };
-
-  schar_T *chars = fconfig->border_chars;
-  int *hl_ids = fconfig->border_hl_ids;
-
-  fconfig->border = true;
-
-  if (style.type == kObjectTypeArray) {
-    Array arr = style.data.array;
-    size_t size = arr.size;
-    if (!size || size > 8 || (size & (size-1))) {
-      api_set_error(err, kErrorTypeValidation,
-                    "invalid number of border chars");
-      return;
+    if (field->opt_index >= 0) {
+      OptKeySet *ks = (OptKeySet *)retval;
+      ks->is_set_ |= (1ULL << field->opt_index);
     }
-    for (size_t i = 0; i < size; i++) {
-      Object iytem = arr.items[i];
-      String string = NULL_STRING;
-      int hl_id = 0;
-      if (iytem.type == kObjectTypeArray) {
-        Array iarr = iytem.data.array;
-        if (!iarr.size || iarr.size > 2) {
-          api_set_error(err, kErrorTypeValidation, "invalid border char");
-          return;
-        }
-        if (iarr.items[0].type != kObjectTypeString) {
-          api_set_error(err, kErrorTypeValidation, "invalid border char");
-          return;
-        }
-        string = iarr.items[0].data.string;
-        if (iarr.size == 2) {
-          hl_id = object_to_hl_id(iarr.items[1], "border char highlight", err);
+
+    char *mem = ((char *)retval + field->ptr_off);
+    Object *value = &dict.items[i].value;
+
+    if (field->type == kObjectTypeNil) {
+      *(Object *)mem = *value;
+    } else if (field->type == kObjectTypeInteger) {
+      if (field->is_hlgroup) {
+        int hl_id = 0;
+        if (value->type != kObjectTypeNil) {
+          hl_id = object_to_hl_id(*value, k.data, err);
           if (ERROR_SET(err)) {
-            return;
+            return false;
           }
         }
-
-      } else if (iytem.type == kObjectTypeString) {
-        string = iytem.data.string;
+        *(Integer *)mem = hl_id;
       } else {
-        api_set_error(err, kErrorTypeValidation, "invalid border char");
-        return;
-      }
-      if (string.size
-          && mb_string2cells_len((char_u *)string.data, string.size) > 1) {
-        api_set_error(err, kErrorTypeValidation,
-                      "border chars must be one cell");
-        return;
-      }
-      size_t len = MIN(string.size, sizeof(*chars)-1);
-      if (len) {
-        memcpy(chars[i], string.data, len);
-      }
-      chars[i][len] = NUL;
-      hl_ids[i] = hl_id;
-    }
-    while (size < 8) {
-      memcpy(chars+size, chars, sizeof(*chars) * size);
-      memcpy(hl_ids+size, hl_ids, sizeof(*hl_ids) * size);
-      size <<= 1;
-    }
-    if ((chars[7][0] && chars[1][0] && !chars[0][0])
-        || (chars[1][0] && chars[3][0] && !chars[2][0])
-        || (chars[3][0] && chars[5][0] && !chars[4][0])
-        || (chars[5][0] && chars[7][0] && !chars[6][0])) {
-      api_set_error(err, kErrorTypeValidation,
-                    "corner between used edges must be specified");
-    }
-  } else if (style.type == kObjectTypeString) {
-    String str = style.data.string;
-    if (str.size == 0 || strequal(str.data, "none")) {
-      fconfig->border = false;
-      return;
-    }
-    for (size_t i = 0; defaults[i].name; i++) {
-      if (strequal(str.data, defaults[i].name)) {
-        memcpy(chars, defaults[i].chars, sizeof(defaults[i].chars));
-        memset(hl_ids, 0, 8 * sizeof(*hl_ids));
-        if (defaults[i].shadow_color) {
-          int hl_blend = SYN_GROUP_STATIC("FloatShadow");
-          int hl_through = SYN_GROUP_STATIC("FloatShadowThrough");
-          hl_ids[2] = hl_through;
-          hl_ids[3] = hl_blend;
-          hl_ids[4] = hl_blend;
-          hl_ids[5] = hl_blend;
-          hl_ids[6] = hl_through;
-        }
-        return;
-      }
-    }
-    api_set_error(err, kErrorTypeValidation,
-                  "invalid border style \"%s\"", str.data);
-  }
-}
-
-bool parse_float_config(Dictionary config, FloatConfig *fconfig, bool reconf,
-                        Error *err)
-{
-  // TODO(bfredl): use a get/has_key interface instead and get rid of extra
-  // flags
-  bool has_row = false, has_col = false, has_relative = false;
-  bool has_external = false, has_window = false;
-  bool has_width = false, has_height = false;
-  bool has_bufpos = false;
-
-  for (size_t i = 0; i < config.size; i++) {
-    char *key = config.items[i].key.data;
-    Object val = config.items[i].value;
-    if (!strcmp(key, "row")) {
-      has_row = true;
-      if (val.type == kObjectTypeInteger) {
-        fconfig->row = (double)val.data.integer;
-      } else if (val.type == kObjectTypeFloat) {
-        fconfig->row = val.data.floating;
-      } else {
-        api_set_error(err, kErrorTypeValidation,
-                      "'row' key must be Integer or Float");
-        return false;
-      }
-    } else if (!strcmp(key, "col")) {
-      has_col = true;
-      if (val.type == kObjectTypeInteger) {
-        fconfig->col = (double)val.data.integer;
-      } else if (val.type == kObjectTypeFloat) {
-        fconfig->col = val.data.floating;
-      } else {
-        api_set_error(err, kErrorTypeValidation,
-                      "'col' key must be Integer or Float");
-        return false;
-      }
-    } else if (strequal(key, "width")) {
-      has_width = true;
-      if (val.type == kObjectTypeInteger && val.data.integer > 0) {
-        fconfig->width = (int)val.data.integer;
-      } else {
-        api_set_error(err, kErrorTypeValidation,
-                      "'width' key must be a positive Integer");
-        return false;
-      }
-    } else if (strequal(key, "height")) {
-      has_height = true;
-      if (val.type == kObjectTypeInteger && val.data.integer > 0) {
-        fconfig->height= (int)val.data.integer;
-      } else {
-        api_set_error(err, kErrorTypeValidation,
-                      "'height' key must be a positive Integer");
-        return false;
-      }
-    } else if (!strcmp(key, "anchor")) {
-      if (val.type != kObjectTypeString) {
-        api_set_error(err, kErrorTypeValidation,
-                      "'anchor' key must be String");
-        return false;
-      }
-      if (!parse_float_anchor(val.data.string, &fconfig->anchor)) {
-        api_set_error(err, kErrorTypeValidation,
-                      "Invalid value of 'anchor' key");
-        return false;
-      }
-    } else if (!strcmp(key, "relative")) {
-      if (val.type != kObjectTypeString) {
-        api_set_error(err, kErrorTypeValidation,
-                      "'relative' key must be String");
-        return false;
-      }
-      // ignore empty string, to match nvim_win_get_config
-      if (val.data.string.size > 0) {
-        has_relative = true;
-        if (!parse_float_relative(val.data.string, &fconfig->relative)) {
-          api_set_error(err, kErrorTypeValidation,
-                        "Invalid value of 'relative' key");
+        VALIDATE_T(field->str, kObjectTypeInteger, value->type, {
           return false;
-        }
+        });
+
+        *(Integer *)mem = value->data.integer;
       }
-    } else if (!strcmp(key, "win")) {
-      has_window = true;
-      if (val.type != kObjectTypeInteger
-          && val.type != kObjectTypeWindow) {
-        api_set_error(err, kErrorTypeValidation,
-                      "'win' key must be Integer or Window");
-        return false;
-      }
-      fconfig->window = (Window)val.data.integer;
-    } else if (!strcmp(key, "bufpos")) {
-      if (val.type != kObjectTypeArray) {
-        api_set_error(err, kErrorTypeValidation,
-                      "'bufpos' key must be Array");
-        return false;
-      }
-      if (!parse_float_bufpos(val.data.array, &fconfig->bufpos)) {
-        api_set_error(err, kErrorTypeValidation,
-                      "Invalid value of 'bufpos' key");
-        return false;
-      }
-      has_bufpos = true;
-    } else if (!strcmp(key, "external")) {
-      if (val.type == kObjectTypeInteger) {
-        fconfig->external = val.data.integer;
-      } else if (val.type == kObjectTypeBoolean) {
-        fconfig->external = val.data.boolean;
+    } else if (field->type == kObjectTypeFloat) {
+      Float *val = (Float *)mem;
+      if (value->type == kObjectTypeInteger) {
+        *val = (Float)value->data.integer;
       } else {
-        api_set_error(err, kErrorTypeValidation,
-                      "'external' key must be Boolean");
-        return false;
+        VALIDATE_T(field->str, kObjectTypeFloat, value->type, {
+          return false;
+        });
+        *val = value->data.floating;
       }
-      has_external = fconfig->external;
-    } else if (!strcmp(key, "focusable")) {
-      if (val.type == kObjectTypeInteger) {
-        fconfig->focusable = val.data.integer;
-      } else if (val.type == kObjectTypeBoolean) {
-        fconfig->focusable = val.data.boolean;
-      } else {
-        api_set_error(err, kErrorTypeValidation,
-                      "'focusable' key must be Boolean");
-        return false;
-      }
-    } else if (!strcmp(key, "border")) {
-      parse_border_style(val, fconfig, err);
+    } else if (field->type == kObjectTypeBoolean) {
+      // caller should check HAS_KEY to override the nil behavior, or GET_BOOL_OR_TRUE
+      // to directly use true when nil
+      *(Boolean *)mem = api_object_to_bool(*value, field->str, false, err);
       if (ERROR_SET(err)) {
         return false;
       }
-    } else if (!strcmp(key, "style")) {
-      if (val.type != kObjectTypeString) {
-        api_set_error(err, kErrorTypeValidation,
-                      "'style' key must be String");
+    } else if (field->type == kObjectTypeString) {
+      VALIDATE_T(field->str, kObjectTypeString, value->type, {
+        return false;
+      });
+      *(String *)mem = value->data.string;
+    } else if (field->type == kObjectTypeArray) {
+      VALIDATE_T(field->str, kObjectTypeArray, value->type, {
+        return false;
+      });
+      *(Array *)mem = value->data.array;
+    } else if (field->type == kObjectTypeDict) {
+      Dict *val = (Dict *)mem;
+      // allow empty array as empty dict for lua (directly or via lua-client RPC)
+      if (value->type == kObjectTypeArray && value->data.array.size == 0) {
+        *val = (Dict)ARRAY_DICT_INIT;
+      } else if (value->type == kObjectTypeDict) {
+        *val = value->data.dict;
+      } else {
+        api_err_exp(err, field->str, api_typename((ObjectType)field->type),
+                    api_typename(value->type));
         return false;
       }
-      if (val.data.string.data[0] == NUL) {
-        fconfig->style = kWinStyleUnused;
-      } else if (striequal(val.data.string.data, "minimal")) {
-        fconfig->style = kWinStyleMinimal;
-      }  else {
-        api_set_error(err, kErrorTypeValidation,
-                      "Invalid value of 'style' key");
+    } else if (field->type == kObjectTypeBuffer || field->type == kObjectTypeWindow
+               || field->type == kObjectTypeTabpage) {
+      if (value->type == kObjectTypeInteger || value->type == (ObjectType)field->type) {
+        *(handle_T *)mem = (handle_T)value->data.integer;
+      } else {
+        api_err_exp(err, field->str, api_typename((ObjectType)field->type),
+                    api_typename(value->type));
+        return false;
+      }
+    } else if (field->type == kObjectTypeLuaRef) {
+      api_set_error(err, kErrorTypeValidation, "Invalid key: '%.*s' is only allowed from Lua",
+                    (int)k.size, k.data);
+      return false;
+    } else {
+      abort();
+    }
+  }
+
+  return true;
+}
+
+Dict api_keydict_to_dict(void *value, KeySetLink *table, size_t max_size, Arena *arena)
+{
+  Dict rv = arena_dict(arena, max_size);
+  for (size_t i = 0; table[i].str; i++) {
+    KeySetLink *field = &table[i];
+    bool is_set = true;
+    if (field->opt_index >= 0) {
+      OptKeySet *ks = (OptKeySet *)value;
+      is_set = ks->is_set_ & (1ULL << field->opt_index);
+    }
+
+    if (!is_set) {
+      continue;
+    }
+
+    char *mem = ((char *)value + field->ptr_off);
+    Object val = NIL;
+
+    if (field->type == kObjectTypeNil) {
+      val = *(Object *)mem;
+    } else if (field->type == kObjectTypeInteger) {
+      val = INTEGER_OBJ(*(Integer *)mem);
+    } else if (field->type == kObjectTypeFloat) {
+      val = FLOAT_OBJ(*(Float *)mem);
+    } else if (field->type == kObjectTypeBoolean) {
+      val = BOOLEAN_OBJ(*(Boolean *)mem);
+    } else if (field->type == kObjectTypeString) {
+      val = STRING_OBJ(*(String *)mem);
+    } else if (field->type == kObjectTypeArray) {
+      val = ARRAY_OBJ(*(Array *)mem);
+    } else if (field->type == kObjectTypeDict) {
+      val = DICT_OBJ(*(Dict *)mem);
+    } else if (field->type == kObjectTypeBuffer || field->type == kObjectTypeWindow
+               || field->type == kObjectTypeTabpage) {
+      val.data.integer = *(handle_T *)mem;
+      val.type = (ObjectType)field->type;
+    } else if (field->type == kObjectTypeLuaRef) {
+      // do nothing
+    } else {
+      abort();
+    }
+
+    PUT_C(rv, field->str, val);
+  }
+
+  return rv;
+}
+
+void api_luarefs_free_object(Object value)
+{
+  // TODO(bfredl): this is more complicated than it needs to be.
+  // we should be able to lock down more specifically where luarefs can be
+  switch (value.type) {
+  case kObjectTypeLuaRef:
+    api_free_luaref(value.data.luaref);
+    break;
+
+  case kObjectTypeArray:
+    api_luarefs_free_array(value.data.array);
+    break;
+
+  case kObjectTypeDict:
+    api_luarefs_free_dict(value.data.dict);
+    break;
+
+  default:
+    break;
+  }
+}
+
+void api_luarefs_free_keydict(void *dict, KeySetLink *table)
+{
+  for (size_t i = 0; table[i].str; i++) {
+    char *mem = ((char *)dict + table[i].ptr_off);
+    if (table[i].type == kObjectTypeNil) {
+      api_luarefs_free_object(*(Object *)mem);
+    } else if (table[i].type == kObjectTypeLuaRef) {
+      api_free_luaref(*(LuaRef *)mem);
+    } else if (table[i].type == kObjectTypeDict) {
+      api_luarefs_free_dict(*(Dict *)mem);
+    }
+  }
+}
+
+void api_luarefs_free_array(Array value)
+{
+  for (size_t i = 0; i < value.size; i++) {
+    api_luarefs_free_object(value.items[i]);
+  }
+}
+
+void api_luarefs_free_dict(Dict value)
+{
+  for (size_t i = 0; i < value.size; i++) {
+    api_luarefs_free_object(value.items[i].value);
+  }
+}
+
+/// Set a named mark
+/// buffer and mark name must be validated already
+/// @param buffer     Buffer to set the mark on
+/// @param name       Mark name
+/// @param line       Line number
+/// @param col        Column/row number
+/// @return true if the mark was set, else false
+bool set_mark(buf_T *buf, String name, Integer line, Integer col, Error *err)
+{
+  buf = buf == NULL ? curbuf : buf;
+  // If line == 0 the marks is being deleted
+  bool res = false;
+  bool deleting = false;
+  if (line == 0) {
+    col = 0;
+    deleting = true;
+  } else {
+    VALIDATE_RANGE(!(col > MAXCOL), "column", {
+      return res;
+    });
+    VALIDATE_RANGE(!(line < 1 || line > buf->b_ml.ml_line_count), "line", {
+      return res;
+    });
+  }
+  assert(INT32_MIN <= line && line <= INT32_MAX);
+  pos_T pos = { (linenr_T)line, (int)col, 0 };
+  res = setmark_pos(*name.data, &pos, buf->handle, NULL);
+  if (!res) {
+    if (deleting) {
+      api_set_error(err, kErrorTypeException,
+                    "Failed to delete named mark: %c", *name.data);
+    } else {
+      api_set_error(err, kErrorTypeException,
+                    "Failed to set named mark: %c", *name.data);
+    }
+  }
+  return res;
+}
+
+/// Get default statusline highlight for window
+const char *get_default_stl_hl(win_T *wp, bool use_winbar, int stc_hl_id)
+{
+  if (wp == NULL) {
+    return "TabLineFill";
+  } else if (use_winbar) {
+    return (wp == curwin) ? "WinBar" : "WinBarNC";
+  } else if (stc_hl_id > 0) {
+    return syn_id2name(stc_hl_id);
+  } else {
+    return (wp == curwin) ? "StatusLine" : "StatusLineNC";
+  }
+}
+
+/// Sets sctx for API calls.
+///
+/// @param channel_id  api client id to determine if it's a internal or RPC call.
+///
+/// @return  previous value of current_sctx. To be used later for restoring sctx.
+sctx_T api_set_sctx(uint64_t channel_id)
+{
+  sctx_T old_current_sctx = current_sctx;
+  // The script context is already properly set when calling an API from Vimscript.
+  if (channel_id != VIML_INTERNAL_CALL) {
+    current_sctx.sc_lnum = 0;
+    if (channel_id == LUA_INTERNAL_CALL) {
+      // When the current script is a Lua script, don't override sc_sid.
+      if (!script_is_lua(current_sctx.sc_sid)) {
+        current_sctx.sc_sid = SID_LUA;
       }
     } else {
-      api_set_error(err, kErrorTypeValidation,
-                    "Invalid key '%s'", key);
-      return false;
+      current_sctx.sc_sid = SID_API_CLIENT;
+      current_sctx.sc_chan = channel_id;
     }
   }
-
-  if (has_window && !(has_relative
-                      && fconfig->relative == kFloatRelativeWindow)) {
-    api_set_error(err, kErrorTypeValidation,
-                  "'win' key is only valid with relative='win'");
-    return false;
-  }
-
-  if ((has_relative && fconfig->relative == kFloatRelativeWindow)
-      && (!has_window || fconfig->window == 0)) {
-    fconfig->window = curwin->handle;
-  }
-
-  if (has_window && !has_bufpos) {
-    fconfig->bufpos.lnum = -1;
-  }
-
-  if (has_bufpos) {
-    if (!has_row) {
-      fconfig->row = (fconfig->anchor & kFloatAnchorSouth) ? 0 : 1;
-      has_row = true;
-    }
-    if (!has_col) {
-      fconfig->col = 0;
-      has_col = true;
-    }
-  }
-
-  if (has_relative && has_external) {
-    api_set_error(err, kErrorTypeValidation,
-                  "Only one of 'relative' and 'external' must be used");
-    return false;
-  } else if (!reconf && !has_relative && !has_external) {
-    api_set_error(err, kErrorTypeValidation,
-                  "One of 'relative' and 'external' must be used");
-    return false;
-  } else if (has_relative) {
-    fconfig->external = false;
-  }
-
-  if (!reconf && !(has_height && has_width)) {
-    api_set_error(err, kErrorTypeValidation,
-                  "Must specify 'width' and 'height'");
-    return false;
-  }
-
-  if (fconfig->external && !ui_has(kUIMultigrid)) {
-    api_set_error(err, kErrorTypeValidation,
-                  "UI doesn't support external windows");
-    return false;
-  }
-
-  if (has_relative != has_row || has_row != has_col) {
-    api_set_error(err, kErrorTypeValidation,
-                  "'relative' requires 'row'/'col' or 'bufpos'");
-    return false;
-  }
-  return true;
+  return old_current_sctx;
 }

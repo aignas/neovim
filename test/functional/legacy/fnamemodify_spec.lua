@@ -1,11 +1,14 @@
 -- Test filename modifiers.
 
-local helpers = require('test.functional.helpers')(after_each)
-local clear, source = helpers.clear, helpers.source
-local call, eq, nvim = helpers.call, helpers.eq, helpers.meths
+local t = require('test.testutil')
+local n = require('test.functional.testnvim')()
+
+local describe, it, before_each = t.describe, t.it, t.before_each
+local clear, source = n.clear, n.source
+local call, eq, api = n.call, t.eq, n.api
 
 local function expected_empty()
-  eq({}, nvim.get_vvar('errors'))
+  eq({}, api.nvim_get_vvar('errors'))
 end
 
 describe('filename modifiers', function()
@@ -29,7 +32,7 @@ describe('filename modifiers', function()
         call assert_equal('test.out', fnamemodify('test.out', ':.'))
         call assert_equal('../testdir/a', fnamemodify('../testdir/a', ':.'))
         call assert_equal(fnamemodify(tmpdir, ':~').'/test.out', fnamemodify('test.out', ':~'))
-        call assert_equal('../testdir/a', fnamemodify('../testdir/a', ':~'))
+        call assert_equal(fnamemodify(tmpdir, ':~').'/../testdir/a', fnamemodify('../testdir/a', ':~'))
         call assert_equal('a', fnamemodify('../testdir/a', ':t'))
         call assert_equal('', fnamemodify('.', ':p:t'))
         call assert_equal('test.out', fnamemodify('test.out', ':p:t'))
@@ -60,22 +63,11 @@ describe('filename modifiers', function()
           call assert_equal("'abc\\\ndef'", fnamemodify("abc\ndef", ':S'))
         endif
       endfunc
-
-      func Test_expand()
-        new
-        call assert_equal("", expand('%:S'))
-        quit
-      endfunc
     ]=])
   end)
 
   it('is working', function()
     call('Test_fnamemodify')
-    expected_empty()
-  end)
-
-  it('works for :S in an unnamed buffer', function()
-    call('Test_expand')
     expected_empty()
   end)
 end)

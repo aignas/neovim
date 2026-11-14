@@ -1,6 +1,8 @@
-local inspect ={
+--- @class (private) vim.InspectModule
+--- @overload fun(root: any, options?: vim.inspect.Opts): string
+local inspect = {
   _VERSION = 'inspect.lua 3.1.0',
-  _URL     = 'http://github.com/kikito/inspect.lua',
+  _URL = 'http://github.com/kikito/inspect.lua',
   _DESCRIPTION = 'human-readable representations of tables',
   _LICENSE = [[
     MIT LICENSE
@@ -25,142 +27,248 @@ local inspect ={
     CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
     TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
     SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-  ]]
+  ]],
 }
 
+inspect.KEY = setmetatable({}, {
+  __tostring = function()
+    return 'inspect.KEY'
+  end,
+})
+inspect.METATABLE = setmetatable({}, {
+  __tostring = function()
+    return 'inspect.METATABLE'
+  end,
+})
+
 local tostring = tostring
+local rep = string.rep
+local match = string.match
+local char = string.char
+local gsub = string.gsub
+local fmt = string.format
 
-inspect.KEY       = setmetatable({}, {__tostring = function() return 'inspect.KEY' end})
-inspect.METATABLE = setmetatable({}, {__tostring = function() return 'inspect.METATABLE' end})
+local sbavailable, stringbuffer = pcall(require, 'string.buffer')
+local buffnew
+local puts
+local render
 
+if sbavailable then
+  buffnew = stringbuffer.new
+  --- @param buf string.buffer
+  --- @param str string
+  puts = function(buf, str)
+    buf:put(str)
+  end
+  --- @param buf string.buffer
+  render = function(buf)
+    return buf:get()
+  end
+else
+  buffnew = function()
+    return { n = 0 }
+  end
+  --- @param buf { [integer]: string, n: integer }
+  --- @param str string
+  puts = function(buf, str)
+    buf.n = buf.n + 1
+    buf[buf.n] = str
+  end
+  --- @param buf string[]
+  render = function(buf)
+    return table.concat(buf)
+  end
+end
+
+-- The constructor, writer and renderer always use the same buffer backend.
+--- @cast puts fun(buf: string.buffer|{ [integer]: string, n: integer }, str: string)
+--- @cast render fun(buf: string.buffer|{ [integer]: string, n: integer }): string
+
+local _rawget
+if rawget then
+  _rawget = rawget
+else
+  --- @generic K, V
+  --- @param t table<K,V>
+  --- @param k K
+  --- @return V?
+  _rawget = function(t, k)
+    return t[k]
+  end
+end
+
+--- @generic K, V
+--- @param t table<K,V>
+--- @return (fun(t: table<K,V>, key?: K): K?, V?), table<K,V>, nil
 local function rawpairs(t)
   return next, t, nil
 end
 
--- Apostrophizes the string if it has quotes, but not aphostrophes
--- Otherwise, it returns a regular quoted string
+--- Apostrophizes the string if it has quotes, but not aphostrophes
+--- Otherwise, it returns a regular quoted string
+--- @param str string
 local function smartQuote(str)
-  if str:match('"') and not str:match("'") then
+  if match(str, '"') and not match(str, "'") then
     return "'" .. str .. "'"
   end
-  return '"' .. str:gsub('"', '\\"') .. '"'
+  return '"' .. gsub(str, '"', '\\"') .. '"'
 end
 
 -- \a => '\\a', \0 => '\\0', 31 => '\31'
 local shortControlCharEscapes = {
-  ["\a"] = "\\a",  ["\b"] = "\\b", ["\f"] = "\\f", ["\n"] = "\\n",
-  ["\r"] = "\\r",  ["\t"] = "\\t", ["\v"] = "\\v"
+  ['\a'] = '\\a',
+  ['\b'] = '\\b',
+  ['\f'] = '\\f',
+  ['\n'] = '\\n',
+  ['\r'] = '\\r',
+  ['\t'] = '\\t',
+  ['\v'] = '\\v',
+  ['\127'] = '\\127',
 }
-local longControlCharEscapes = {} -- \a => nil, \0 => \000, 31 => \031
-for i=0, 31 do
-  local ch = string.char(i)
+local longControlCharEscapes = { ['\127'] = '\127' }
+for i = 0, 31 do
+  local ch = char(i)
   if not shortControlCharEscapes[ch] then
-    shortControlCharEscapes[ch] = "\\"..i
-    longControlCharEscapes[ch]  = string.format("\\%03d", i)
+    shortControlCharEscapes[ch] = '\\' .. i
+    longControlCharEscapes[ch] = fmt('\\%03d', i)
   end
 end
 
+--- @param str string
 local function escape(str)
-  return (str:gsub("\\", "\\\\")
-             :gsub("(%c)%f[0-9]", longControlCharEscapes)
-             :gsub("%c", shortControlCharEscapes))
+  return (
+    gsub(
+      gsub(gsub(str, '\\', '\\\\'), '(%c)%f[0-9]', longControlCharEscapes),
+      '%c',
+      shortControlCharEscapes
+    )
+  )
 end
 
+local luaKeywords = {}
+for k in
+  ([[ and break do else elseif end false for function goto if
+             in local nil not or repeat return then true until while
+]]):gmatch('%w+')
+do
+  luaKeywords[k] = true
+end
+
+--- @param str any
 local function isIdentifier(str)
-  return type(str) == 'string' and str:match( "^[_%a][_%a%d]*$" )
+  return type(str) == 'string'
+    -- identifier must start with a letter and underscore, and be followed by letters, numbers, and underscores
+    and not not str:match('^[_%a][_%a%d]*$')
+    -- lua keywords are not valid identifiers
+    and not luaKeywords[str]
 end
 
+local flr = math.floor
+
+--- @param k any
+--- @param sequenceLength integer
 local function isSequenceKey(k, sequenceLength)
-  return type(k) == 'number'
-     and 1 <= k
-     and k <= sequenceLength
-     and math.floor(k) == k
+  return type(k) == 'number' and flr(k) == k and 1 <= k and k <= sequenceLength
 end
 
 local defaultTypeOrders = {
-  ['number']   = 1, ['boolean']  = 2, ['string'] = 3, ['table'] = 4,
-  ['function'] = 5, ['userdata'] = 6, ['thread'] = 7
+  ['number'] = 1,
+  ['boolean'] = 2,
+  ['string'] = 3,
+  ['table'] = 4,
+  ['function'] = 5,
+  ['userdata'] = 6,
+  ['thread'] = 7,
 }
 
+--- @param a any
+--- @param b any
 local function sortKeys(a, b)
   local ta, tb = type(a), type(b)
 
   -- strings and numbers are sorted numerically/alphabetically
-  if ta == tb and (ta == 'string' or ta == 'number') then return a < b end
-
-  local dta, dtb = defaultTypeOrders[ta], defaultTypeOrders[tb]
-  -- Two default types are compared according to the defaultTypeOrders table
-  if dta and dtb then return defaultTypeOrders[ta] < defaultTypeOrders[tb]
-  elseif dta     then return true  -- default types before custom ones
-  elseif dtb     then return false -- custom types after default ones
+  if ta == tb and (ta == 'string' or ta == 'number') then
+    return a < b
   end
+
+  local dta = defaultTypeOrders[ta] or 100
+  local dtb = defaultTypeOrders[tb] or 100
+  -- Two default types are compared according to the defaultTypeOrders table
 
   -- custom types are sorted out alphabetically
-  return ta < tb
+  return dta == dtb and ta < tb or dta < dtb
 end
 
--- For implementation reasons, the behavior of rawlen & # is "undefined" when
--- tables aren't pure sequences. So we implement our own # operator.
-local function getSequenceLength(t)
-  local len = 1
-  local v = rawget(t,len)
-  while v ~= nil do
-    len = len + 1
-    v = rawget(t,len)
+--- @generic K
+--- @param t table<K,any>
+--- @return K[], integer, integer
+local function getKeys(t)
+  local seqLen = 1
+  while _rawget(t, seqLen) ~= nil do
+    seqLen = seqLen + 1
   end
-  return len - 1
-end
+  seqLen = seqLen - 1
 
-local function getNonSequentialKeys(t)
-  local keys, keysLength = {}, 0
-  local sequenceLength = getSequenceLength(t)
-  for k,_ in rawpairs(t) do
-    if not isSequenceKey(k, sequenceLength) then
-      keysLength = keysLength + 1
-      keys[keysLength] = k
+  local keys, keysLen = {}, 0
+  for k in rawpairs(t) do
+    if not isSequenceKey(k, seqLen) then
+      keysLen = keysLen + 1
+      keys[keysLen] = k
     end
   end
   table.sort(keys, sortKeys)
-  return keys, keysLength, sequenceLength
+  return keys, keysLen, seqLen
 end
 
-local function countTableAppearances(t, tableAppearances)
-  tableAppearances = tableAppearances or {}
-
-  if type(t) == 'table' then
-    if not tableAppearances[t] then
-      tableAppearances[t] = 1
-      for k,v in rawpairs(t) do
-        countTableAppearances(k, tableAppearances)
-        countTableAppearances(v, tableAppearances)
-      end
-      countTableAppearances(getmetatable(t), tableAppearances)
+--- @param x any
+--- @param cycles table<table,integer>
+--- @param depth number
+local function countCycles(x, cycles, depth)
+  if type(x) == 'table' then
+    if cycles[x] then
+      cycles[x] = cycles[x] + 1
     else
-      tableAppearances[t] = tableAppearances[t] + 1
+      cycles[x] = 1
+      if depth > 0 then
+        for k, v in rawpairs(x) do
+          countCycles(k, cycles, depth - 1)
+          countCycles(v, cycles, depth - 1)
+        end
+        countCycles(getmetatable(x), cycles, depth - 1)
+      end
     end
   end
-
-  return tableAppearances
 end
 
-local copySequence = function(s)
-  local copy, len = {}, #s
-  for i=1, len do copy[i] = s[i] end
-  return copy, len
-end
-
-local function makePath(path, ...)
-  local keys = {...}
-  local newPath, len = copySequence(path)
-  for i=1, #keys do
-    newPath[len + i] = keys[i]
+--- @generic T
+--- @param path T[]
+--- @param a T
+--- @param b? T
+--- @return T[]
+local function makePath(path, a, b)
+  local newPath = {}
+  local len = #path
+  for i = 1, len do
+    newPath[i] = path[i]
   end
+
+  newPath[len + 1] = a
+  newPath[len + 2] = b
+
   return newPath
 end
 
+--- @param process fun(item: any, path: any[]): any
+--- @param item any
+--- @param path any[]
+--- @param visited table<any,any>
 local function processRecursive(process, item, path, visited)
-  if item == nil then return nil end
-  if visited[item] then return visited[item] end
+  if item == nil then
+    return nil
+  end
+  if visited[item] then
+    return visited[item]
+  end
 
   local processed = process(item, path)
   if type(processed) == 'table' then
@@ -168,171 +276,207 @@ local function processRecursive(process, item, path, visited)
     visited[item] = processedCopy
     local processedKey
 
-    for k,v in rawpairs(processed) do
+    for k, v in rawpairs(processed) do
       processedKey = processRecursive(process, k, makePath(path, k, inspect.KEY), visited)
       if processedKey ~= nil then
-        processedCopy[processedKey] = processRecursive(process, v, makePath(path, processedKey), visited)
+        processedCopy[processedKey] =
+          processRecursive(process, v, makePath(path, processedKey), visited)
       end
     end
 
-    local mt  = processRecursive(process, getmetatable(processed), makePath(path, inspect.METATABLE), visited)
-    if type(mt) ~= 'table' then mt = nil end -- ignore not nil/table __metatable field
+    local mt =
+      processRecursive(process, getmetatable(processed), makePath(path, inspect.METATABLE), visited)
+    if type(mt) ~= 'table' then
+      mt = nil
+    end
     setmetatable(processedCopy, mt)
     processed = processedCopy
   end
   return processed
 end
 
-
-
--------------------------------------------------------------------
-
+--- @class (private) vim.inspect.Inspector
+--- @field buf string.buffer|{ [integer]: string, n: integer }
+--- @field ids table<any,integer>
+--- @field cycles table<table,integer>
+--- @field depth number
+--- @field level integer
+--- @field newline string
+--- @field indent string
 local Inspector = {}
-local Inspector_mt = {__index = Inspector}
 
-function Inspector:puts(...)
-  local args   = {...}
-  local buffer = self.buffer
-  local len    = #buffer
-  for i=1, #args do
-    len = len + 1
-    buffer[len] = args[i]
-  end
+local Inspector_mt = { __index = Inspector }
+
+--- @param inspector vim.inspect.Inspector
+local function tabify(inspector)
+  puts(inspector.buf, inspector.newline .. rep(inspector.indent, inspector.level))
 end
 
-function Inspector:down(f)
-  self.level = self.level + 1
-  f()
-  self.level = self.level - 1
-end
-
-function Inspector:tabify()
-  self:puts(self.newline, string.rep(self.indent, self.level))
-end
-
-function Inspector:alreadyVisited(v)
-  return self.ids[v] ~= nil
-end
-
+--- @nodoc
+--- @param v any
 function Inspector:getId(v)
   local id = self.ids[v]
+  local ids = self.ids
   if not id then
     local tv = type(v)
-    id              = (self.maxIds[tv] or 0) + 1
-    self.maxIds[tv] = id
-    self.ids[v]     = id
+    id = (ids[tv] or 0) + 1
+    ids[v], ids[tv] = id, id
   end
   return tostring(id)
 end
 
-function Inspector:putKey(k)
-  if isIdentifier(k) then return self:puts(k) end
-  self:puts("[")
-  self:putValue(k)
-  self:puts("]")
-end
+--- @nodoc
+--- @param v any
+function Inspector:putValue(v)
+  local buf = self.buf
+  local tv = type(v)
+  if tv == 'string' then
+    puts(buf, smartQuote(escape(v)))
+  elseif
+    tv == 'number'
+    or tv == 'boolean'
+    or tv == 'nil'
+    or tv == 'cdata'
+    or tv == 'ctype'
+    or (vim and v == vim.NIL)
+  then
+    puts(buf, tostring(v))
+  elseif tv == 'table' and not self.ids[v] then
+    local t = v
 
-function Inspector:putTable(t)
-  if t == inspect.KEY or t == inspect.METATABLE then
-    self:puts(tostring(t))
-  elseif self:alreadyVisited(t) then
-    self:puts('<table ', self:getId(t), '>')
-  elseif self.level >= self.depth then
-    self:puts('{...}')
-  else
-    if self.tableAppearances[t] > 1 then self:puts('<', self:getId(t), '>') end
-
-    local nonSequentialKeys, nonSequentialKeysLength, sequenceLength = getNonSequentialKeys(t)
-    local mt                = getmetatable(t)
-    if (vim and sequenceLength == 0 and nonSequentialKeysLength == 0
-        and mt == vim._empty_dict_mt) then
-      self:puts(tostring(t))
-      return
-    end
-
-    self:puts('{')
-    self:down(function()
-      local count = 0
-      for i=1, sequenceLength do
-        if count > 0 then self:puts(',') end
-        self:puts(' ')
-        self:putValue(t[i])
-        count = count + 1
+    if t == inspect.KEY or t == inspect.METATABLE then
+      puts(buf, tostring(t))
+    elseif self.level >= self.depth then
+      puts(buf, '{...}')
+    else
+      if self.cycles[t] > 1 then
+        puts(buf, fmt('<%d>', self:getId(t)))
       end
 
-      for i=1, nonSequentialKeysLength do
-        local k = nonSequentialKeys[i]
-        if count > 0 then self:puts(',') end
-        self:tabify()
-        self:putKey(k)
-        self:puts(' = ')
-        self:putValue(t[k])
-        count = count + 1
+      local keys, keysLen, seqLen = getKeys(t)
+      local mt = getmetatable(t)
+
+      if vim and seqLen == 0 and keysLen == 0 and mt == vim._empty_dict_mt then
+        puts(buf, tostring(t))
+        return
+      end
+
+      puts(buf, '{')
+      self.level = self.level + 1
+
+      for i = 1, seqLen + keysLen do
+        if i > 1 then
+          puts(buf, ',')
+        end
+        if i <= seqLen then
+          puts(buf, ' ')
+          self:putValue(t[i])
+        else
+          local k = keys[i - seqLen]
+          tabify(self)
+          if isIdentifier(k) then
+            puts(buf, k)
+          else
+            puts(buf, '[')
+            self:putValue(k)
+            puts(buf, ']')
+          end
+          puts(buf, ' = ')
+          self:putValue(t[k])
+        end
       end
 
       if type(mt) == 'table' then
-        if count > 0 then self:puts(',') end
-        self:tabify()
-        self:puts('<metatable> = ')
+        if seqLen + keysLen > 0 then
+          puts(buf, ',')
+        end
+        tabify(self)
+        puts(buf, '<metatable> = ')
         self:putValue(mt)
       end
-    end)
 
-    if nonSequentialKeysLength > 0 or type(mt) == 'table' then -- result is multi-lined. Justify closing }
-      self:tabify()
-    elseif sequenceLength > 0 then -- array tables have one extra space before closing }
-      self:puts(' ')
+      self.level = self.level - 1
+
+      if keysLen > 0 or type(mt) == 'table' then
+        tabify(self)
+      elseif seqLen > 0 then
+        puts(buf, ' ')
+      end
+
+      puts(buf, '}')
     end
-
-    self:puts('}')
-  end
-end
-
-function Inspector:putValue(v)
-  local tv = type(v)
-
-  if tv == 'string' then
-    self:puts(smartQuote(escape(v)))
-  elseif tv == 'number' or tv == 'boolean' or tv == 'nil' or
-         tv == 'cdata' or tv == 'ctype' or (vim and v == vim.NIL) then
-    self:puts(tostring(v))
-  elseif tv == 'table' then
-    self:putTable(v)
   else
-    self:puts('<', tv, ' ', self:getId(v), '>')
+    puts(buf, fmt('<%s %d>', tv, self:getId(v)))
   end
 end
 
--------------------------------------------------------------------
+--- @inlinedoc
+--- @class vim.inspect.Opts
+---
+--- Maximum table nesting depth. Deeper tables are shown as `{...}`.
+--- (default: unlimited)
+--- @field depth? integer
+---
+--- String used for line breaks.
+--- (default: `"\n"`)
+--- @field newline? string
+---
+--- String repeated for each level of indentation.
+--- (default: `"  "`)
+--- @field indent? string
+---
+--- Transforms values, keys, and metatables before formatting. Return a replacement value,
+--- or `nil` to omit a table entry. {path} lists the keys leading to {item}, with
+--- `vim.inspect.KEY` appended for keys or `vim.inspect.METATABLE` for metatables.
+--- The root has an empty path.
+--- @field process? fun(item: any, path: any[]): any
 
+--- @nodoc
+--- @param root any
+--- @param options? vim.inspect.Opts
+--- @return string
 function inspect.inspect(root, options)
-  options       = options or {}
+  options = options or {}
 
-  local depth   = options.depth   or math.huge
+  local depth = options.depth or math.huge
   local newline = options.newline or '\n'
-  local indent  = options.indent  or '  '
+  local indent = options.indent or '  '
   local process = options.process
 
   if process then
     root = processRecursive(process, root, {}, {})
   end
 
+  local cycles = {}
+  countCycles(root, cycles, depth)
+
   local inspector = setmetatable({
-    depth            = depth,
-    level            = 0,
-    buffer           = {},
-    ids              = {},
-    maxIds           = {},
-    newline          = newline,
-    indent           = indent,
-    tableAppearances = countTableAppearances(root)
+    buf = buffnew(),
+    ids = {},
+    cycles = cycles,
+    depth = depth,
+    level = 0,
+    newline = newline,
+    indent = indent,
   }, Inspector_mt)
 
   inspector:putValue(root)
 
-  return table.concat(inspector.buffer)
+  return render(inspector.buf)
 end
 
-setmetatable(inspect, { __call = function(_, ...) return inspect.inspect(...) end })
+setmetatable(inspect, {
+  --- Gets a human-readable representation of the given object.
+  ---
+  --- @see |vim.print()|
+  --- @see https://github.com/kikito/inspect.lua
+  --- @see https://github.com/mpeterv/vinspect
+  --- @param root any
+  --- @param options? vim.inspect.Opts
+  --- @return string
+  __call = function(_, root, options)
+    return inspect.inspect(root, options)
+  end,
+})
 
 return inspect

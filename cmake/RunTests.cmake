@@ -1,19 +1,35 @@
+if(DEFINED TEST_PARALLEL_GROUP)
+  if(DEFINED ENV{TEST_FILE})
+    message(FATAL_ERROR "$TEST_FILE should not be used with parallel tests")
+  endif()
+  set(TEST_SUFFIX "_${TEST_PARALLEL_GROUP}")
+  string(REGEX REPLACE "[^A-Za-z0-9_]" "_" TEST_SUFFIX ${TEST_SUFFIX})
+else()
+  set(TEST_SUFFIX "")
+endif()
+
+set(ENV{NVIM_TEST} "1")
+# Test runner should use the runtime from the build, not the system install (if any).
+set(ENV{VIMRUNTIME} ${ROOT_DIR}/runtime)
 # Set LC_ALL to meet expectations of some locale-sensitive tests.
 set(ENV{LC_ALL} "en_US.UTF-8")
+set(TEST_XDG_PREFIX ${BUILD_DIR}/Xtest_xdg${TEST_SUFFIX})
+unset(ENV{XDG_DATA_DIRS})
+unset(ENV{NVIM})  # Clear $NVIM in case tests are running from Nvim. #11009
+unset(ENV{TMUX})  # Nvim TUI shouldn't think it's running in tmux. #34173
+unset(ENV{SSH_CONNECTION})  # Default 'statusline' shouldn't show the hostname.
 
-if(POLICY CMP0012)
-  # Handle CI=true, without dev warnings.
-  cmake_policy(SET CMP0012 NEW)
-endif()
-
-set(ENV{VIMRUNTIME} ${WORKING_DIR}/runtime)
-set(ENV{NVIM_RPLUGIN_MANIFEST} ${BUILD_DIR}/Xtest_rplugin_manifest)
-set(ENV{XDG_CONFIG_HOME} ${BUILD_DIR}/Xtest_xdg/config)
-set(ENV{XDG_DATA_HOME} ${BUILD_DIR}/Xtest_xdg/share)
+# Prepare for running tests in ${TEST_XDG_PREFIX}.
+file(MAKE_DIRECTORY ${TEST_XDG_PREFIX})
+file(CREATE_LINK ${ROOT_DIR}/runtime ${TEST_XDG_PREFIX}/runtime SYMBOLIC)
+file(CREATE_LINK ${ROOT_DIR}/src ${TEST_XDG_PREFIX}/src SYMBOLIC)
+file(CREATE_LINK ${ROOT_DIR}/test ${TEST_XDG_PREFIX}/test SYMBOLIC)
+file(CREATE_LINK ${ROOT_DIR}/README.md ${TEST_XDG_PREFIX}/README.md SYMBOLIC)
 
 if(NOT DEFINED ENV{NVIM_LOG_FILE})
-  set(ENV{NVIM_LOG_FILE} ${BUILD_DIR}/.nvimlog)
+  set(ENV{NVIM_LOG_FILE} ${BUILD_DIR}/nvim.log)
 endif()
+set(ENV{NVIM_LOG_FILE} "$ENV{NVIM_LOG_FILE}${TEST_SUFFIX}")
 
 if(NVIM_PRG)
   set(ENV{NVIM_PRG} "${NVIM_PRG}")
@@ -21,66 +37,94 @@ endif()
 
 if(DEFINED ENV{TEST_FILE})
   set(TEST_PATH "$ENV{TEST_FILE}")
+elseif(DEFINED TEST_PARALLEL_GROUP)
+  set(TEST_PATH "${TEST_DIR}/${TEST_TYPE}/${TEST_PARALLEL_GROUP}")
 else()
   set(TEST_PATH "${TEST_DIR}/${TEST_TYPE}")
 endif()
 
+if(NOT DEFINED TEST_SUMMARY_FILE)
+  set(TEST_SUMMARY_FILE "-")
+endif()
+
 # Force $TEST_PATH to workdir-relative path ("test/…").
 if(IS_ABSOLUTE ${TEST_PATH})
-  file(RELATIVE_PATH TEST_PATH "${WORKING_DIR}" "${TEST_PATH}")
+  file(RELATIVE_PATH TEST_PATH "${ROOT_DIR}" "${TEST_PATH}")
 endif()
 
-if(BUSTED_OUTPUT_TYPE STREQUAL junit)
-  set(EXTRA_ARGS OUTPUT_FILE ${BUILD_DIR}/${TEST_TYPE}test-junit.xml)
-endif()
-
-set(BUSTED_ARGS $ENV{BUSTED_ARGS})
-separate_arguments(BUSTED_ARGS)
+separate_arguments(TEST_ARGS NATIVE_COMMAND $ENV{TEST_ARGS})
 
 if(DEFINED ENV{TEST_TAG} AND NOT "$ENV{TEST_TAG}" STREQUAL "")
-  list(APPEND BUSTED_ARGS --tags $ENV{TEST_TAG})
+  list(APPEND TEST_ARGS --tags $ENV{TEST_TAG})
 endif()
 
 if(DEFINED ENV{TEST_FILTER} AND NOT "$ENV{TEST_FILTER}" STREQUAL "")
-  list(APPEND BUSTED_ARGS --filter $ENV{TEST_FILTER})
+  list(APPEND TEST_ARGS --filter $ENV{TEST_FILTER})
 endif()
 
-# TMPDIR: use relative test path (for parallel test runs / isolation).
-set(ENV{TMPDIR} "${BUILD_DIR}/Xtest_tmpdir/${TEST_PATH}")
-execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory $ENV{TMPDIR})
+if(DEFINED ENV{TEST_FILTER_OUT} AND NOT "$ENV{TEST_FILTER_OUT}" STREQUAL "")
+  list(APPEND TEST_ARGS --filter-out $ENV{TEST_FILTER_OUT})
+endif()
 
-set(ENV{SYSTEM_NAME} ${CMAKE_HOST_SYSTEM_NAME})  # used by test/helpers.lua.
+# TMPDIR: for testutil.tmpname() and Nvim tempname().
+set(ENV{TMPDIR} "${BUILD_DIR}/Xtest_tmpdir${TEST_SUFFIX}")
+file(MAKE_DIRECTORY $ENV{TMPDIR})
+
+# HISTFILE: do not write into user's ~/.bash_history
+set(ENV{HISTFILE} "/dev/null")
+
+if(NOT DEFINED ENV{TEST_TIMEOUT} OR "$ENV{TEST_TIMEOUT}" STREQUAL "")
+  set(ENV{TEST_TIMEOUT} 1200)
+endif()
+
+set(ENV{SYSTEM_NAME} ${CMAKE_HOST_SYSTEM_NAME})  # used by test/testutil.lua.
+
+if(NOT WIN32)
+  # Tests assume POSIX "sh" and may fail if SHELL=fish. #24941 #6172
+  set(ENV{SHELL} sh)
+endif()
+
 execute_process(
-  COMMAND ${BUSTED_PRG} -v -o test.busted.outputHandlers.${BUSTED_OUTPUT_TYPE}
-    --lazy --helper=${TEST_DIR}/${TEST_TYPE}/preload.lua
+  COMMAND ${NVIM_PRG} -l ${ROOT_DIR}/test/runner.lua -X${TEST_XDG_PREFIX} -v
+    --summary-file=${TEST_SUMMARY_FILE}
+    --helper=${TEST_DIR}/${TEST_TYPE}/preload.lua
     --lpath=${BUILD_DIR}/?.lua
-    --lpath=${WORKING_DIR}/runtime/lua/?.lua
-    --lpath=?.lua
-    ${BUSTED_ARGS}
+    ${TEST_ARGS}
     ${TEST_PATH}
-  WORKING_DIRECTORY ${WORKING_DIR}
-  ERROR_VARIABLE err
+  TIMEOUT $ENV{TEST_TIMEOUT}
+  WORKING_DIRECTORY ${TEST_XDG_PREFIX}
   RESULT_VARIABLE res
   ${EXTRA_ARGS})
 
-file(GLOB RM_FILES ${BUILD_DIR}/Xtest_*)
-file(REMOVE_RECURSE ${RM_FILES})
+file(REMOVE_RECURSE ${TEST_XDG_PREFIX})
+file(REMOVE_RECURSE $ENV{TMPDIR})
 
-if(NOT res EQUAL 0)
-  message(STATUS "Tests exited non-zero: ${res}")
-  if("${err}" STREQUAL "")
-    message(STATUS "No output to stderr.")
+macro(PRINT_NVIM_LOG)
+  file(READ $ENV{NVIM_LOG_FILE} out)
+  if(${TEST_SUMMARY_FILE} STREQUAL "-")
+    message(STATUS "$NVIM_LOG_FILE: $ENV{NVIM_LOG_FILE}\n${out}")
   else()
-    message(STATUS "Output to stderr:\n${err}")
+    file(APPEND ${TEST_SUMMARY_FILE} "$NVIM_LOG_FILE: $ENV{NVIM_LOG_FILE}\n${out}")
   endif()
+endmacro()
+
+if(res)
+  message(STATUS "Tests exited non-zero: ${res}")
 
   # Dump the logfile on CI (if not displayed and moved already).
-  if($ENV{CI})
+  if(CI_BUILD)
     if(EXISTS $ENV{NVIM_LOG_FILE} AND NOT EXISTS $ENV{NVIM_LOG_FILE}.displayed)
-      file(READ $ENV{NVIM_LOG_FILE} out)
-      message(STATUS "$NVIM_LOG_FILE: $ENV{NVIM_LOG_FILE}\n${out}")
+      PRINT_NVIM_LOG()
     endif()
   endif()
 
   message(FATAL_ERROR "${TEST_TYPE} tests failed with error: ${res}")
+endif()
+
+if(CI_BUILD)
+  file(SIZE $ENV{NVIM_LOG_FILE} FILE_SIZE)
+  if(NOT ${FILE_SIZE} MATCHES "^0$")
+    PRINT_NVIM_LOG()
+    message(FATAL_ERROR "$NVIM_LOG_FILE is not empty")
+  endif()
 endif()
